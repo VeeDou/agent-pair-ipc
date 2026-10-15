@@ -128,6 +128,37 @@ class TestCommon(unittest.TestCase):
             self.assertEqual(loaded.get("codex"), "sess_codex_123")
             self.assertEqual(loaded.get("claude"), "sess_claude_456")
 
+    def test_bindings_search_stops_at_git_boundary(self):
+        from agent_pair_ipc.common import find_project_bindings_file, unbind_project_binding
+        with tempfile.TemporaryDirectory() as outer:
+            outer_p = Path(outer)
+            # Create a binding in outer directory
+            save_project_binding("codex", "outer_sess", cwd=outer)
+
+            # Create an inner repository with a .git boundary
+            repo_root = outer_p / "my_project"
+            repo_root.mkdir()
+            (repo_root / ".git").mkdir()
+
+            sub_dir = repo_root / "src" / "pkg"
+            sub_dir.mkdir(parents=True)
+
+            # Searching from sub_dir must NOT escape my_project past .git to outer directory!
+            found = find_project_bindings_file(cwd=str(sub_dir))
+            self.assertIsNone(found)
+
+            # Once a binding is saved in repo_root, searching from sub_dir finds it
+            save_project_binding("codex", "inner_sess", cwd=str(sub_dir))
+            found = find_project_bindings_file(cwd=str(sub_dir))
+            self.assertIsNotNone(found)
+            self.assertEqual(found.resolve(), (repo_root / ".agent-pair" / "bindings.json").resolve())
+
+            # Test unbind
+            ok = unbind_project_binding("codex", cwd=str(sub_dir))
+            self.assertTrue(ok)
+            loaded = load_project_bindings(cwd=str(sub_dir))
+            self.assertNotIn("codex", loaded)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -18,6 +18,12 @@ EXIT_ERROR = 1
 EXIT_CHANGES_REQUESTED = 2
 EXIT_NO_VERDICT = 3
 EXIT_QUEUED_UNCONSUMED = 4
+EXIT_NEEDS_NEW_THREAD = 5
+
+
+class NeedsNewSessionError(RuntimeError):
+    """Raised when an interactive new session/thread is required but running in a non-interactive environment."""
+    pass
 
 
 class TailReader:
@@ -65,12 +71,18 @@ class TailReader:
 
 
 def find_project_bindings_file(cwd: str | None = None) -> Path | None:
-    """Find .agent-pair/bindings.json starting from cwd walking up parents."""
+    """
+    Find .agent-pair/bindings.json starting from cwd walking up parents.
+    Stops traversing past the repository root (.git), .agent-pair, or user home directory ($HOME).
+    """
     cur = Path(cwd or os.getcwd()).resolve()
+    home = Path.home().resolve()
     for p in [cur] + list(cur.parents):
         bindings = p / ".agent-pair" / "bindings.json"
         if bindings.is_file():
             return bindings
+        if (p / ".agent-pair").is_dir() or (p / ".git").exists() or p == home or p == p.parent:
+            break
     return None
 
 
@@ -89,21 +101,52 @@ def load_project_bindings(cwd: str | None = None) -> dict[str, str]:
 
 def save_project_binding(agent_name: str, session_id: str, cwd: str | None = None) -> Path:
     """Save target session binding for an agent into .agent-pair/bindings.json."""
-    base = Path(cwd or os.getcwd()).resolve()
-    target_dir = base / ".agent-pair"
-    target_dir.mkdir(parents=True, exist_ok=True)
-    target_file = target_dir / "bindings.json"
+    cur = Path(cwd or os.getcwd()).resolve()
+    existing = find_project_bindings_file(cur)
+    if existing:
+        target_file = existing
+        target_dir = existing.parent
+    else:
+        target_root = cur
+        for p in [cur] + list(cur.parents):
+            if (p / ".agent-pair").is_dir() or (p / ".git").exists():
+                target_root = p
+                break
+        target_dir = target_root / ".agent-pair"
+        target_dir.mkdir(parents=True, exist_ok=True)
+        target_file = target_dir / "bindings.json"
+
     data = {}
     if target_file.is_file():
         try:
             with open(target_file, "r", encoding="utf-8") as f:
                 data = json.load(f)
+                if not isinstance(data, dict):
+                    data = {}
         except Exception:
             data = {}
     data[agent_name] = session_id
     with open(target_file, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2, ensure_ascii=False)
     return target_file
+
+
+def unbind_project_binding(agent_name: str, cwd: str | None = None) -> bool:
+    """Remove target session binding for an agent from .agent-pair/bindings.json."""
+    bfile = find_project_bindings_file(cwd)
+    if not bfile or not bfile.is_file():
+        return False
+    try:
+        with open(bfile, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, dict) and agent_name in data:
+            del data[agent_name]
+            with open(bfile, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2, ensure_ascii=False)
+            return True
+    except Exception:
+        pass
+    return False
 
 
 def resolve_message_payload(

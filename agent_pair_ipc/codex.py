@@ -12,14 +12,17 @@ import os
 import subprocess
 import sys
 import time
+import datetime
 from pathlib import Path
 
 from agent_pair_ipc.common import (
     EXIT_CHANGES_REQUESTED,
     EXIT_ERROR,
+    EXIT_NEEDS_NEW_THREAD,
     EXIT_NO_VERDICT,
     EXIT_QUEUED_UNCONSUMED,
     EXIT_SIGN_OFF,
+    NeedsNewSessionError,
     TailReader,
     attach_request_header,
     extract_verdict,
@@ -27,6 +30,7 @@ from agent_pair_ipc.common import (
     load_project_bindings,
     resolve_message_payload,
     save_project_binding,
+    unbind_project_binding,
 )
 
 
@@ -154,7 +158,7 @@ def match_session(
     allow_cwd_fallback: bool = True,
     pick_latest: bool = False,
     debug: bool = False,
-) -> dict | None:
+) -> tuple[dict | None, str]:
     """
     Match a session from candidates by target query:
     - ID exact match
@@ -165,8 +169,11 @@ def match_session(
     - Automatically excludes `source == 'exec'` (CLI sessions)
     - If multiple sessions match CWD:
         - If `pick_latest` is True: picks the one with most recent rollout mtime
-        - If `pick_latest` is False: REFUSES to guess, prints candidate list, returns None
+        - If `pick_latest` is False: REFUSES to guess, prints candidate list, returns (None, "ambiguous")
     - Warns if target session was updated > 30 minutes ago
+
+    Returns:
+        tuple[session_dict | None, status_str] where status_str is 'matched', 'ambiguous', or 'none'.
     """
     resolved_target, source_kind = resolve_target_session(target)
 
@@ -174,32 +181,38 @@ def match_session(
         candidates = get_all_sessions(limit=40, debug=debug)
 
     if not candidates:
-        return None
+        return None, "none"
 
     if resolved_target:
         target_str = str(resolved_target).strip()
         for c in candidates:
             if c["id"] == target_str:
-                return enrich_session_info(c)
+                return enrich_session_info(c), "matched"
         for c in candidates:
             if c["name"] == target_str:
-                return enrich_session_info(c)
+                return enrich_session_info(c), "matched"
         if len(target_str) >= 6:
             for c in candidates:
                 if c["id"].startswith(target_str):
-                    return enrich_session_info(c)
+                    return enrich_session_info(c), "matched"
         for c in candidates:
             if target_str.lower() in c["name"].lower():
-                return enrich_session_info(c)
+                return enrich_session_info(c), "matched"
         if len(target_str) >= 8:
             direct_file = find_session_file(target_str)
             if direct_file:
                 c = {"id": target_str, "name": target_str, "updated_at": "", "jsonl_path": str(direct_file), "cwd": None}
-                return enrich_session_info(c)
-        return None
+                return enrich_session_info(c), "matched"
+
+        if source_kind == "bindings_file":
+            print(f"\n[Codex IPC] Error: Bound session '{target_str}' in .agent-pair/bindings.json was not found.", file=sys.stderr)
+            print("👉 The bound session may have been deleted or archived.", file=sys.stderr)
+            print("   Run with `-s <session_id>` to target another session, or run with `--unbind`.\n", file=sys.stderr)
+
+        return None, "none"
 
     if not allow_cwd_fallback:
-        return None
+        return None, "none"
 
     # Auto-match by current working directory (CWD)
     current_cwd = os.getcwd()
@@ -213,7 +226,7 @@ def match_session(
             cwd_matches.append(c)
 
     if not cwd_matches:
-        return None
+        return None, "none"
 
     if len(cwd_matches) == 1:
         chosen = cwd_matches[0]
@@ -230,7 +243,7 @@ def match_session(
             print(f"  • [{m['id']}] \"{m.get('name', 'Untitled')}\" (Updated: {mtime_str}, {origin})", file=sys.stderr)
         print("\nPlease specify a target session with `-s <id_or_title>`, set AGENT_PAIR_CODEX_THREAD,", file=sys.stderr)
         print("save to .agent-pair/bindings.json, or pass `--pick-latest` to confirm.\n", file=sys.stderr)
-        return None
+        return None, "ambiguous"
 
     # Staleness check
     mtime = chosen.get("mtime", 0.0)
@@ -238,49 +251,84 @@ def match_session(
         mins = int((time.time() - mtime) / 60)
         print(f"[Codex IPC] Warning: Target session \"{chosen.get('name')}\" [{chosen['id'][:8]}...] was last updated {mins} minutes ago and may be sleeping in background.", file=sys.stderr)
 
-    return chosen
+    return chosen, "matched"
 
 
-def await_new_thread(timeout: float = 60.0, cwd: str | None = None, debug: bool = False) -> dict | None:
+def await_new_thread(
+    timeout: float = 60.0,
+    cwd: str | None = None,
+    require_tty: bool = True,
+    debug: bool = False,
+) -> dict | None:
     """
     Watch ~/.codex/sessions for a newly created session rollout matching current CWD and source != 'exec'.
+    Snapshots pre-existing sessions to guarantee older or touched sessions are never misidentified.
+    In non-interactive environments (non-TTY), exits immediately instead of blocking.
     When detected, automatically binds it to .agent-pair/bindings.json and returns the session info.
     """
-    watch_start = time.time()
     target_cwd = cwd or os.getcwd()
+    if require_tty and not sys.stderr.isatty():
+        print(f"[Codex IPC] Notice: No existing Codex session found for project '{target_cwd}'.", file=sys.stderr)
+        print("[Codex IPC] Cannot interactively wait for new thread in non-interactive environment (non-TTY).", file=sys.stderr)
+        print("👉 Please create a new thread in Codex Desktop, or run with -s <session_id>.", file=sys.stderr)
+        raise NeedsNewSessionError("Cannot await new thread in non-TTY environment")
+
+    watch_start = time.time()
     sessions_root = Path.home() / ".codex" / "sessions"
     print(f"[Codex IPC] Waiting for new thread in Codex Desktop for '{target_cwd}'... (Click 'New Thread' in Desktop app)", file=sys.stderr)
 
+    today_dt = datetime.date.today()
+    yesterday_dt = today_dt - datetime.timedelta(days=1)
+    date_subdirs = [
+        sessions_root / today_dt.strftime("%Y/%m/%d"),
+        sessions_root / yesterday_dt.strftime("%Y/%m/%d"),
+    ]
+
+    existing_files = set()
+    initial_session_ids = set()
+    for d in date_subdirs:
+        if d.is_dir():
+            for rfile in d.glob("rollout-*.jsonl"):
+                existing_files.add(str(rfile.resolve()))
+                meta = get_session_meta_from_file(rfile)
+                sid = meta.get("id")
+                if sid:
+                    initial_session_ids.add(sid)
+
     while time.time() - watch_start < timeout:
         time.sleep(0.5)
-        # Check today's date directory
-        today_dir = sessions_root / time.strftime("%Y/%m/%d")
-        if not today_dir.is_dir():
-            continue
-        try:
-            for rfile in today_dir.glob("rollout-*.jsonl"):
-                st = rfile.stat()
-                if st.st_mtime >= watch_start - 2.0:
+        for d in date_subdirs:
+            if not d.is_dir():
+                continue
+            try:
+                for rfile in d.glob("rollout-*.jsonl"):
+                    rpath = str(rfile.resolve())
+                    if rpath in existing_files:
+                        continue
+                    st = rfile.stat()
+                    if st.st_ctime < watch_start - 0.5 and st.st_mtime < watch_start - 0.5:
+                        continue
                     meta = get_session_meta_from_file(rfile)
+                    sid = meta.get("id")
+                    if not sid or sid in initial_session_ids:
+                        continue
                     if meta.get("cwd") == target_cwd and meta.get("source") != "exec":
-                        sid = meta.get("id")
-                        if sid:
-                            save_project_binding("codex", sid, cwd=target_cwd)
-                            print(f"[Codex IPC] Detected new thread [{sid}]! Automatically bound to .agent-pair/bindings.json.", file=sys.stderr)
-                            return {
-                                "id": sid,
-                                "name": "New Thread",
-                                "updated_at": "",
-                                "jsonl_path": str(rfile),
-                                "cwd": target_cwd,
-                                "source": meta.get("source"),
-                                "originator": meta.get("originator"),
-                                "mtime": st.st_mtime,
-                            }
-        except Exception as e:
-            if debug:
-                print(f"[Codex IPC Debug] Error polling new thread: {e}", file=sys.stderr)
-            continue
+                        save_project_binding("codex", sid, cwd=target_cwd)
+                        print(f"[Codex IPC] Detected new thread [{sid}]! Automatically bound to .agent-pair/bindings.json.", file=sys.stderr)
+                        return {
+                            "id": sid,
+                            "name": "New Thread",
+                            "updated_at": "",
+                            "jsonl_path": str(rfile),
+                            "cwd": target_cwd,
+                            "source": meta.get("source"),
+                            "originator": meta.get("originator"),
+                            "mtime": st.st_mtime,
+                        }
+            except Exception as e:
+                if debug:
+                    print(f"[Codex IPC Debug] Error polling new thread: {e}", file=sys.stderr)
+                continue
 
     print(f"[Codex IPC] Timed out waiting for new thread after {int(timeout)}s.", file=sys.stderr)
     return None
@@ -345,9 +393,10 @@ def read_transcript_messages(jsonl_path: str | None, last_n: int = 1, only_final
 
 def read_latest_feedback(target: str | None = None, n: int = 1, only_final: bool = True, pick_latest: bool = False) -> list[dict]:
     """Fetch the latest assistant turns from target session."""
-    session = match_session(target=target, pick_latest=pick_latest)
+    session, status = match_session(target=target, pick_latest=pick_latest)
     if not session:
-        print(f"[Codex IPC] No matching session found for target '{target}'.", file=sys.stderr)
+        if status != "ambiguous":
+            print(f"[Codex IPC] No matching session found for target '{target}'.", file=sys.stderr)
         return []
 
     jsonl_path = session.get("jsonl_path")
@@ -358,9 +407,22 @@ def read_latest_feedback(target: str | None = None, n: int = 1, only_final: bool
     return read_transcript_messages(jsonl_path, last_n=n, only_final=only_final)
 
 
-def send_message_to_codex(message: str, target: str | None = None, pick_latest: bool = False, debug: bool = False) -> bool:
+def send_message_to_codex(
+    message: str,
+    target: str | None = None,
+    pick_latest: bool = False,
+    auto_await_new: bool = True,
+    debug: bool = False,
+) -> bool:
     """Send message to Codex session via `codex queue`."""
-    session = match_session(target=target, pick_latest=pick_latest, debug=debug)
+    session, status = match_session(target=target, pick_latest=pick_latest, debug=debug)
+    if not session:
+        if status == "ambiguous":
+            return False
+        resolved_target, _ = resolve_target_session(target)
+        if resolved_target is None and auto_await_new:
+            session = await_new_thread(timeout=60.0, cwd=os.getcwd(), debug=debug)
+
     if not session:
         if target:
             print(f"[Codex IPC] Error: No matching session found for target '{target}'.", file=sys.stderr)
@@ -394,6 +456,7 @@ def send_and_wait(
     show_progress: bool = True,
     sender_name: str = "Antigravity",
     pick_latest: bool = False,
+    auto_await_new: bool = True,
     debug: bool = False,
 ) -> tuple[str | None, str | None]:
     """
@@ -405,7 +468,17 @@ def send_and_wait(
     Returns:
         tuple[response_text, verdict]
     """
-    session = match_session(target=target, pick_latest=pick_latest, debug=debug)
+    session, status = match_session(target=target, pick_latest=pick_latest, debug=debug)
+    if not session:
+        if status == "ambiguous":
+            return None, None
+        resolved_target, _ = resolve_target_session(target)
+        if resolved_target is None and auto_await_new:
+            try:
+                session = await_new_thread(timeout=60.0, cwd=os.getcwd(), debug=debug)
+            except NeedsNewSessionError:
+                return None, "NEEDS_NEW_THREAD"
+
     if not session:
         if target:
             print(f"[Codex IPC] Error: No matching session found for target '{target}'.", file=sys.stderr)
@@ -426,7 +499,7 @@ def send_and_wait(
     nonce = generate_nonce()
     full_message = attach_request_header(message, nonce=nonce, sender=sender_name)
 
-    ok = send_message_to_codex(full_message, target=session["id"], pick_latest=pick_latest, debug=debug)
+    ok = send_message_to_codex(full_message, target=session["id"], pick_latest=pick_latest, auto_await_new=False, debug=debug)
     if not ok:
         return None, None
 
@@ -451,9 +524,10 @@ def send_and_wait(
 
         # Fast Fail: Nonce not consumed after fast_fail_timeout
         if not found_request and elapsed > fast_fail_timeout:
-            print(f"\n[Codex IPC] Error: Queued message was not consumed after {int(fast_fail_timeout)}s (Req-ID: {nonce}).", file=sys.stderr)
-            print(f"[Codex IPC] Target session \"{session.get('name')}\" [{session['id']}] is likely sleeping in a background tab.", file=sys.stderr)
-            print(f"[Codex IPC] Action required: Switch to Codex Desktop and open/click tab \"{session.get('name')}\" to activate processing.\n", file=sys.stderr)
+            print(f"\n[Codex IPC] Notice: Message is queued but was not consumed within {int(fast_fail_timeout)}s (Req-ID: {nonce}).", file=sys.stderr)
+            print(f"[Codex IPC] Target session \"{session.get('name')}\" [{session['id']}] might be inactive or busy executing another task.", file=sys.stderr)
+            print("[Codex IPC] NOTE: The message remains safely in Codex's internal queue; do NOT resend duplicate messages.", file=sys.stderr)
+            print(f"[Codex IPC] Action: Switch to Codex Desktop and activate session \"{session.get('name')}\", or run `codex-ipc -r` later to check for completion.\n", file=sys.stderr)
             return None, "QUEUED_UNCONSUMED"
 
         new_lines = tail_reader.read_new_lines()
@@ -556,13 +630,16 @@ def build_parser() -> argparse.ArgumentParser:
   # 2. Bind current project to specific thread:
   codex-ipc --bind 01a13f4a-64e9-7243-a6a2-f2dc809f7b02
 
-  # 3. Wait for new thread in Desktop app, auto-bind and deliver report:
+  # 3. Unbind project session:
+  codex-ipc --unbind
+
+  # 4. Wait for new thread in Desktop app, auto-bind and deliver report:
   codex-ipc --await-new-thread -w -f docs/reports/REVIEW_REQUEST.md
 
-  # 4. Deliver report file and wait for review completion:
+  # 5. Deliver report file and wait for review completion:
   codex-ipc -w -f docs/reports/REVIEW_REQUEST.md
 
-  # 5. Deliver report picking latest if multiple sessions exist:
+  # 6. Deliver report picking latest if multiple sessions exist:
   codex-ipc -w --pick-latest -f docs/reports/REVIEW_REQUEST.md
 """
     )
@@ -573,6 +650,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--prefix", dest="prefix", default=None, help="Optional text prefix to prepend before file/stdin content")
     parser.add_argument("-s", "--session", dest="session_target", default=None, help="Target session ID or title")
     parser.add_argument("--bind", dest="bind_target", default=None, help="Bind target session ID to current project in .agent-pair/bindings.json")
+    parser.add_argument("--unbind", action="store_true", help="Remove the project session binding in .agent-pair/bindings.json")
     parser.add_argument("--pick-latest", action="store_true", help="Pick the latest session if multiple match current project CWD")
     parser.add_argument("--await-new-thread", action="store_true", help="Wait for a new thread to be created in Codex Desktop, auto-bind and send")
     parser.add_argument("-l", "--list", action="store_true", help="List recent Codex sessions")
@@ -582,6 +660,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("-w", "--wait", action="store_true", help="Send message and synchronously wait for Codex response")
     parser.add_argument("-t", "--timeout", type=float, default=300.0, help="Wait timeout in seconds (default: 300)")
     parser.add_argument("--fast-fail", type=float, default=15.0, help="Fast fail timeout in seconds if nonce not consumed (default: 15.0)")
+    parser.add_argument("--no-auto-new", action="store_true", help="Disable automatic wait-for-new-thread when no session exists for project")
     parser.add_argument("--debug", action="store_true", help="Enable verbose debug logs")
     return parser
 
@@ -593,6 +672,13 @@ def main(argv: list[str] | None = None) -> int:
     if args.bind_target:
         bfile = save_project_binding("codex", args.bind_target)
         print(f"[Codex IPC] Bound Codex session '{args.bind_target}' to {bfile}")
+        return EXIT_SIGN_OFF
+
+    if args.unbind:
+        if unbind_project_binding("codex"):
+            print("[Codex IPC] Removed Codex binding from .agent-pair/bindings.json.")
+        else:
+            print("[Codex IPC] No active Codex binding found to remove.")
         return EXIT_SIGN_OFF
 
     if args.list:
@@ -613,10 +699,13 @@ def main(argv: list[str] | None = None) -> int:
         return EXIT_SIGN_OFF
 
     if args.await_new_thread:
-        new_sess = await_new_thread(timeout=60.0, debug=args.debug)
-        if not new_sess:
-            return EXIT_ERROR
-        target = new_sess["id"]
+        try:
+            new_sess = await_new_thread(timeout=60.0, require_tty=False, debug=args.debug)
+            if not new_sess:
+                return EXIT_ERROR
+            target = new_sess["id"]
+        except NeedsNewSessionError:
+            return EXIT_NEEDS_NEW_THREAD
 
     msg_text, resolved_target = resolve_message_payload(
         message_arg=args.message,
@@ -640,10 +729,13 @@ def main(argv: list[str] | None = None) -> int:
             timeout=args.timeout,
             fast_fail_timeout=args.fast_fail,
             pick_latest=args.pick_latest,
+            auto_await_new=not args.no_auto_new,
             debug=args.debug,
         )
         if verdict == "QUEUED_UNCONSUMED":
             return EXIT_QUEUED_UNCONSUMED
+        if verdict == "NEEDS_NEW_THREAD":
+            return EXIT_NEEDS_NEW_THREAD
         if resp is not None:
             print("\n=== [Codex Response] ===")
             print(resp)
@@ -656,8 +748,17 @@ def main(argv: list[str] | None = None) -> int:
                 return EXIT_NO_VERDICT
         return EXIT_ERROR
 
-    ok = send_message_to_codex(msg_text, target=target, pick_latest=args.pick_latest, debug=args.debug)
-    return EXIT_SIGN_OFF if ok else EXIT_ERROR
+    try:
+        ok = send_message_to_codex(
+            msg_text,
+            target=target,
+            pick_latest=args.pick_latest,
+            auto_await_new=not args.no_auto_new,
+            debug=args.debug,
+        )
+        return EXIT_SIGN_OFF if ok else EXIT_ERROR
+    except NeedsNewSessionError:
+        return EXIT_NEEDS_NEW_THREAD
 
 
 if __name__ == "__main__":

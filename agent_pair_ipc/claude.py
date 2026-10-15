@@ -18,8 +18,10 @@ from pathlib import Path
 from agent_pair_ipc.common import (
     EXIT_CHANGES_REQUESTED,
     EXIT_ERROR,
+    EXIT_NEEDS_NEW_THREAD,
     EXIT_NO_VERDICT,
     EXIT_SIGN_OFF,
+    NeedsNewSessionError,
     TailReader,
     attach_request_header,
     extract_nonce,
@@ -28,6 +30,7 @@ from agent_pair_ipc.common import (
     load_project_bindings,
     resolve_message_payload,
     save_project_binding,
+    unbind_project_binding,
 )
 
 
@@ -179,8 +182,9 @@ def match_session(
     target: str | None = None,
     candidates: list[dict] | None = None,
     allow_cwd_fallback: bool = True,
+    pick_latest: bool = False,
     debug: bool = False,
-) -> dict | None:
+) -> tuple[dict | None, str]:
     """
     Match a session from candidates by target query:
     - host_session_id (exact or prefix >= 6 chars)
@@ -189,73 +193,161 @@ def match_session(
     - name (exact or case-insensitive substring)
     
     If target is not given, matches session by current project CWD.
-    If no session matches CWD, does NOT blindly guess: returns None to prevent misdelivery.
+    If multiple sessions match CWD:
+      - If `pick_latest` is True: picks the latest active session
+      - If `pick_latest` is False: REFUSES to guess, prints candidate list, returns (None, "ambiguous")
+
+    Returns:
+        tuple[session_dict | None, status_str] where status_str is 'matched', 'ambiguous', or 'none'.
     """
     if candidates is None:
         candidates = get_active_sessions(exclude_self=True, debug=debug)
 
     if not candidates:
-        return None
+        return None, "none"
 
-    resolved_target, _ = resolve_target_session(target)
+    resolved_target, source_kind = resolve_target_session(target)
 
     if resolved_target:
         target_str = str(resolved_target).strip()
         # 1. Exact match on host_session_id
         for c in candidates:
             if c["host_session_id"] == target_str:
-                return c
+                return c, "matched"
         # 2. Exact match on session_id
         for c in candidates:
             if c["session_id"] == target_str:
-                return c
+                return c, "matched"
         # 3. Exact match on PID
         for c in candidates:
             if str(c["pid"]) == target_str:
-                return c
+                return c, "matched"
         # 4. Exact match on name
         for c in candidates:
             if c["name"] == target_str:
-                return c
+                return c, "matched"
         # 5. Prefix match on host_session_id (>= 6 chars)
         if len(target_str) >= 6:
             for c in candidates:
                 if c["host_session_id"].startswith(target_str):
-                    return c
+                    return c, "matched"
         # 6. Prefix match on session_id (>= 6 chars)
         if len(target_str) >= 6:
             for c in candidates:
                 if c["session_id"].startswith(target_str):
-                    return c
+                    return c, "matched"
         # 7. Substring match on name (case-insensitive)
         for c in candidates:
             if target_str.lower() in c["name"].lower():
-                return c
-        return None
+                return c, "matched"
+
+        if source_kind == "bindings_file":
+            print(f"\n[Claude Code IPC] Error: Bound session '{target_str}' in .agent-pair/bindings.json was not found.", file=sys.stderr)
+            print("👉 The bound session may have ended or been closed.", file=sys.stderr)
+            print("   Run with `-s <session_id>` to target another session, or run with `--unbind`.\n", file=sys.stderr)
+
+        return None, "none"
 
     if not allow_cwd_fallback:
-        return None
+        return None, "none"
 
     # Match by current working directory (CWD)
     current_cwd = os.getcwd()
     cwd_matches = [c for c in candidates if c.get("cwd") == current_cwd]
-    if cwd_matches:
-        # Prioritize interactive sessions in current CWD
-        interactive = [c for c in cwd_matches if c["kind"] == "interactive"]
-        return interactive[0] if interactive else cwd_matches[0]
+    if not cwd_matches:
+        return None, "none"
 
-    # No session found matching current CWD: Do NOT guess!
+    if len(cwd_matches) == 1:
+        return cwd_matches[0], "matched"
+    elif pick_latest:
+        cwd_matches.sort(key=lambda x: x.get("mtime", 0.0), reverse=True)
+        chosen = cwd_matches[0]
+        sid_display = chosen.get("host_session_id") or chosen.get("session_id") or str(chosen.get("pid"))
+        print(f"[Claude Code IPC] Notice: Multiple sessions found for this project. Using latest due to `--pick-latest`: \"{chosen.get('name')}\" [{sid_display}]", file=sys.stderr)
+        return chosen, "matched"
+    else:
+        # Strict disambiguation: refuse to guess!
+        print(f"\n[Claude Code IPC] Error: Ambiguous sessions! Multiple active Claude Code sessions found for directory '{current_cwd}':", file=sys.stderr)
+        for m in cwd_matches:
+            mtime_str = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(m.get('mtime', 0.0))) if m.get('mtime') else 'unknown'
+            sid_display = m.get('host_session_id') or m.get('session_id') or str(m.get('pid'))
+            print(f"  • [{sid_display}] \"{m.get('name', 'Untitled')}\" (PID: {m.get('pid')}, Kind: {m.get('kind')}, Active: {mtime_str})", file=sys.stderr)
+        print("\nPlease specify a target session with `-s <session_id|name|pid>`, set AGENT_PAIR_CLAUDE_SESSION,", file=sys.stderr)
+        print("save to .agent-pair/bindings.json, or pass `--pick-latest` to confirm.\n", file=sys.stderr)
+        return None, "ambiguous"
+
+
+def await_new_session(
+    timeout: float = 60.0,
+    cwd: str | None = None,
+    require_tty: bool = True,
+    debug: bool = False,
+) -> dict | None:
+    """
+    Watch for a new Claude Code session matching current CWD.
+    Snapshots pre-existing sessions to guarantee older sessions are never misidentified.
+    In non-interactive environments (non-TTY), exits immediately instead of blocking.
+    When detected, automatically binds hostSessionId/sessionId (never raw PID) to .agent-pair/bindings.json.
+    """
+    target_cwd = cwd or os.getcwd()
+    if require_tty and not sys.stderr.isatty():
+        print(f"[Claude Code IPC] Notice: No existing Claude Code session found for project '{target_cwd}'.", file=sys.stderr)
+        print("[Claude Code IPC] Cannot interactively wait for new session in non-interactive environment (non-TTY).", file=sys.stderr)
+        print("👉 Please open project in Claude Desktop or run `claude` in terminal, or run with -s <session_id>.", file=sys.stderr)
+        raise NeedsNewSessionError("Cannot await new session in non-TTY environment")
+
+    watch_start = time.time()
+    print(f"[Claude Code IPC] Waiting for Claude Code session for '{target_cwd}'... (Open project in Claude Desktop or run `claude` in terminal)", file=sys.stderr)
+
+    # Snapshot initial sessions
+    initial = get_active_sessions(exclude_self=True, debug=debug)
+    initial_ids = set()
+    for s in initial:
+        if s.get("host_session_id"):
+            initial_ids.add(s["host_session_id"])
+        if s.get("session_id"):
+            initial_ids.add(s["session_id"])
+        if s.get("pid"):
+            initial_ids.add(str(s["pid"]))
+
+    while time.time() - watch_start < timeout:
+        time.sleep(1.0)
+        sessions = get_active_sessions(exclude_self=True, debug=debug)
+        for s in sessions:
+            if s.get("cwd") == target_cwd:
+                sid = s.get("host_session_id") or s.get("session_id")
+                pid_str = str(s.get("pid"))
+                if (sid and sid in initial_ids) or (pid_str in initial_ids):
+                    continue
+                # Only bind stable host_session_id or session_id, never raw PID
+                bind_id = s.get("host_session_id") or s.get("session_id")
+                if bind_id:
+                    save_project_binding("claude", bind_id, cwd=target_cwd)
+                    print(f"[Claude Code IPC] Detected new session [{bind_id}]! Automatically bound to .agent-pair/bindings.json.", file=sys.stderr)
+                return s
+
+    print(f"[Claude Code IPC] Timed out waiting for Claude Code session after {int(timeout)}s.", file=sys.stderr)
     return None
 
 
-def send_message_to_claude(message: str, target: str | None = None, debug: bool = False) -> bool:
+def send_message_to_claude(
+    message: str,
+    target: str | None = None,
+    pick_latest: bool = False,
+    auto_await_new: bool = True,
+    debug: bool = False,
+) -> bool:
     """Send message to target Claude Code session via Unix Domain Socket."""
     candidates = get_active_sessions(exclude_self=True, debug=debug)
-    if not candidates:
-        print("[Claude Code IPC] Error: No connectable Claude Code sessions found.", file=sys.stderr)
-        return False
+    session, status = match_session(target=target, candidates=candidates, pick_latest=pick_latest, debug=debug) if candidates else (None, "none")
 
-    session = match_session(target=target, candidates=candidates, debug=debug)
+    if not session:
+        if status == "ambiguous":
+            return False
+        resolved_target, _ = resolve_target_session(target)
+        if resolved_target is None and auto_await_new:
+            session = await_new_session(timeout=60.0, cwd=os.getcwd(), debug=debug)
+
     if not session:
         if target:
             print(f"[Claude Code IPC] Error: No matching session found for target '{target}'.", file=sys.stderr)
@@ -338,12 +430,13 @@ def read_transcript_messages(transcript_path: str | None, last_n: int = 1, only_
     return turns[-last_n:]
 
 
-def read_latest_feedback(target: str | None = None, n: int = 1, only_final: bool = True) -> list[dict]:
+def read_latest_feedback(target: str | None = None, n: int = 1, only_final: bool = True, pick_latest: bool = False) -> list[dict]:
     """Fetch the latest assistant turns from the target session."""
     candidates = get_active_sessions(exclude_self=False)
-    session = match_session(target=target, candidates=candidates)
+    session, status = match_session(target=target, candidates=candidates, pick_latest=pick_latest) if candidates else (None, "none")
     if not session:
-        print(f"[Claude Code IPC] No matching session found for target '{target}'.", file=sys.stderr)
+        if status != "ambiguous":
+            print(f"[Claude Code IPC] No matching session found for target '{target}'.", file=sys.stderr)
         return []
 
     transcript_path = session.get("transcript_path")
@@ -360,6 +453,8 @@ def send_and_wait(
     timeout: float = 300.0,
     show_progress: bool = True,
     sender_name: str = "Antigravity",
+    pick_latest: bool = False,
+    auto_await_new: bool = True,
     debug: bool = False,
 ) -> tuple[str | None, str | None]:
     """
@@ -370,11 +465,18 @@ def send_and_wait(
         tuple[response_text, verdict]
     """
     candidates = get_active_sessions(exclude_self=True, debug=debug)
-    if not candidates:
-        print("[Claude Code IPC] Error: No connectable Claude Code sessions found.", file=sys.stderr)
-        return None, None
+    session, status = match_session(target=target, candidates=candidates, pick_latest=pick_latest, debug=debug) if candidates else (None, "none")
 
-    session = match_session(target=target, candidates=candidates, debug=debug)
+    if not session:
+        if status == "ambiguous":
+            return None, None
+        resolved_target, _ = resolve_target_session(target)
+        if resolved_target is None and auto_await_new:
+            try:
+                session = await_new_session(timeout=60.0, cwd=os.getcwd(), debug=debug)
+            except NeedsNewSessionError:
+                return None, "NEEDS_NEW_THREAD"
+
     if not session:
         if target:
             print(f"[Claude Code IPC] Error: No matching session found for target '{target}'.", file=sys.stderr)
@@ -392,7 +494,7 @@ def send_and_wait(
     nonce = generate_nonce()
     full_message = attach_request_header(message, nonce=nonce, sender=sender_name)
 
-    ok = send_message_to_claude(full_message, target=session["host_session_id"] or str(session["pid"]), debug=debug)
+    ok = send_message_to_claude(full_message, target=session["host_session_id"] or str(session["pid"]), pick_latest=pick_latest, auto_await_new=False, debug=debug)
     if not ok:
         return None, None
 
@@ -520,13 +622,19 @@ def build_parser() -> argparse.ArgumentParser:
   # 1. List active sessions:
   claude-ipc --list
 
-  # 2. Deliver file content and wait for response (Auto-detects current project session!):
+  # 3. Unbind project session:
+  claude-ipc --unbind
+
+  # 4. Deliver file content and wait for response (Auto-detects current project session!):
   claude-ipc -w -f docs/reports/REVIEW_REQUEST.md
 
-  # 3. Explicitly send to session with -m:
+  # 5. Deliver report picking latest if multiple sessions exist:
+  claude-ipc -w --pick-latest -f docs/reports/REVIEW_REQUEST.md
+
+  # 6. Explicitly send to session with -m:
   claude-ipc -w -m "Please run tests." sessA
 
-  # 4. Read latest assistant response:
+  # 7. Read latest assistant response:
   claude-ipc -r
   claude-ipc -r -n 3
 """
@@ -538,6 +646,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--prefix", dest="prefix", default=None, help="Optional text prefix to prepend before file/stdin content")
     parser.add_argument("-s", "--session", dest="session_target", default=None, help="Target session ID, hostSessionId, title/name, or PID")
     parser.add_argument("--bind", dest="bind_target", default=None, help="Bind target session ID to current project in .agent-pair/bindings.json")
+    parser.add_argument("--unbind", action="store_true", help="Remove the project session binding in .agent-pair/bindings.json")
+    parser.add_argument("--pick-latest", action="store_true", help="Pick the latest session if multiple match current project CWD")
+    parser.add_argument("--await-new-session", action="store_true", help="Wait for a new Claude Code session for this project, auto-bind and send")
+    parser.add_argument("--no-auto-new", action="store_true", help="Disable automatic wait-for-new-session when no session exists for project")
     parser.add_argument("-l", "--list", action="store_true", help="List all currently active and connectable Claude Code sessions")
     parser.add_argument("-r", "--read", action="store_true", help="Read the latest assistant feedback/response from the target session")
     parser.add_argument("-a", "--all-turns", action="store_true", help="Include intermediate tool-use turns when reading transcript (default: final turns only)")
@@ -557,6 +669,13 @@ def main(argv: list[str] | None = None) -> int:
         print(f"[Claude Code IPC] Bound Claude Code session '{args.bind_target}' to {bfile}")
         return EXIT_SIGN_OFF
 
+    if args.unbind:
+        if unbind_project_binding("claude"):
+            print("[Claude Code IPC] Removed Claude binding from .agent-pair/bindings.json.")
+        else:
+            print("[Claude Code IPC] No active Claude binding found to remove.")
+        return EXIT_SIGN_OFF
+
     if args.list:
         list_sessions(debug=args.debug)
         return EXIT_SIGN_OFF
@@ -565,7 +684,7 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.read:
         target = target or args.target_pos or args.message
-        feedback = read_latest_feedback(target=target, n=args.number, only_final=not args.all_turns)
+        feedback = read_latest_feedback(target=target, n=args.number, only_final=not args.all_turns, pick_latest=args.pick_latest)
         if not feedback:
             return EXIT_ERROR
         for i, turn in enumerate(feedback):
@@ -573,6 +692,15 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"--- Turn {i+1} [{turn.get('timestamp')}] ---")
             print(turn["text"])
         return EXIT_SIGN_OFF
+
+    if args.await_new_session:
+        try:
+            new_sess = await_new_session(timeout=60.0, require_tty=False, debug=args.debug)
+            if not new_sess:
+                return EXIT_ERROR
+            target = new_sess.get("host_session_id") or new_sess.get("session_id") or str(new_sess["pid"])
+        except NeedsNewSessionError:
+            return EXIT_NEEDS_NEW_THREAD
 
     msg_text, resolved_target = resolve_message_payload(
         message_arg=args.message,
@@ -590,7 +718,16 @@ def main(argv: list[str] | None = None) -> int:
     target = resolved_target
 
     if args.wait:
-        resp, verdict = send_and_wait(msg_text, target=target, timeout=args.timeout, debug=args.debug)
+        resp, verdict = send_and_wait(
+            msg_text,
+            target=target,
+            timeout=args.timeout,
+            pick_latest=args.pick_latest,
+            auto_await_new=not args.no_auto_new,
+            debug=args.debug,
+        )
+        if verdict == "NEEDS_NEW_THREAD":
+            return EXIT_NEEDS_NEW_THREAD
         if resp is not None:
             print("\n=== [Claude Code Response] ===")
             print(resp)
@@ -603,8 +740,17 @@ def main(argv: list[str] | None = None) -> int:
                 return EXIT_NO_VERDICT
         return EXIT_ERROR
 
-    ok = send_message_to_claude(msg_text, target=target, debug=args.debug)
-    return EXIT_SIGN_OFF if ok else EXIT_ERROR
+    try:
+        ok = send_message_to_claude(
+            msg_text,
+            target=target,
+            pick_latest=args.pick_latest,
+            auto_await_new=not args.no_auto_new,
+            debug=args.debug,
+        )
+        return EXIT_SIGN_OFF if ok else EXIT_ERROR
+    except NeedsNewSessionError:
+        return EXIT_NEEDS_NEW_THREAD
 
 
 if __name__ == "__main__":

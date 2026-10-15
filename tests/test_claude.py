@@ -107,8 +107,86 @@ class TestClaude(unittest.TestCase):
                 "kind": "interactive",
             }
         ]
-        matched = match_session(target=None, candidates=candidates)
+        matched, status = match_session(target=None, candidates=candidates)
         self.assertIsNone(matched)
+        self.assertEqual(status, "none")
+
+    def test_match_session_ambiguity_and_pick_latest(self):
+        import os
+        candidates = [
+            {
+                "pid": 1001,
+                "session_id": "sess_old",
+                "host_session_id": "host_old",
+                "name": "Old Claude Session",
+                "cwd": os.getcwd(),
+                "mtime": 100.0,
+            },
+            {
+                "pid": 1002,
+                "session_id": "sess_new",
+                "host_session_id": "host_new",
+                "name": "New Claude Session",
+                "cwd": os.getcwd(),
+                "mtime": 200.0,
+            },
+        ]
+        # Strict disambiguation: without pick_latest, returns ambiguous
+        matched, status = match_session(target=None, candidates=candidates, pick_latest=False)
+        self.assertIsNone(matched)
+        self.assertEqual(status, "ambiguous")
+
+        # With pick_latest: picks sess_new
+        matched, status = match_session(target=None, candidates=candidates, pick_latest=True)
+        self.assertEqual(status, "matched")
+        self.assertIsNotNone(matched)
+        self.assertEqual(matched["session_id"], "sess_new")
+
+    def test_claude_never_binds_raw_pid(self):
+        """P1 parity: await_new_session must bind hostSessionId or sessionId, never raw PID."""
+        import os
+        from unittest.mock import patch
+        from agent_pair_ipc.claude import await_new_session
+
+        fake_session = {
+            "pid": 99999,
+            "session_id": "uuid-sess-1234",
+            "host_session_id": "local_bec81a52-3f90-4199-a1ac-ed3b3290588d",
+            "cwd": os.getcwd(),
+        }
+
+        with patch("agent_pair_ipc.claude.get_active_sessions", side_effect=[[], [fake_session]]), \
+             patch("agent_pair_ipc.claude.save_project_binding") as mock_save, \
+             patch("sys.stderr.isatty", return_value=True):
+            res = await_new_session(timeout=2.0)
+            self.assertIsNotNone(res)
+            self.assertTrue(mock_save.called)
+            # Bound value must be host_session_id, NOT raw PID 99999
+            agent_arg, bound_arg = mock_save.call_args[0][:2]
+            self.assertEqual(agent_arg, "claude")
+            self.assertEqual(bound_arg, "local_bec81a52-3f90-4199-a1ac-ed3b3290588d")
+            self.assertNotEqual(bound_arg, "99999")
+
+    def test_claude_non_tty_auto_await_exits_with_needs_new_thread(self):
+        """P1 parity: In non-TTY environment, auto-await exits with code 5."""
+        from unittest.mock import patch
+        from agent_pair_ipc.common import EXIT_NEEDS_NEW_THREAD, NeedsNewSessionError
+        from agent_pair_ipc.claude import await_new_session, main, send_and_wait
+
+        with patch("sys.stderr.isatty", return_value=False):
+            with self.assertRaises(NeedsNewSessionError):
+                await_new_session(timeout=5.0, require_tty=True)
+
+            with patch("agent_pair_ipc.claude.get_active_sessions", return_value=[]), \
+                 patch("agent_pair_ipc.claude.resolve_target_session", return_value=(None, "auto")):
+                resp, verdict = send_and_wait("Hello", target=None, auto_await_new=True)
+                self.assertIsNone(resp)
+                self.assertEqual(verdict, "NEEDS_NEW_THREAD")
+
+            with patch("agent_pair_ipc.claude.get_active_sessions", return_value=[]), \
+                 patch("agent_pair_ipc.claude.resolve_target_session", return_value=(None, "auto")):
+                code = main(["-w", "-m", "Hello"])
+                self.assertEqual(code, EXIT_NEEDS_NEW_THREAD)
 
 
 if __name__ == "__main__":
