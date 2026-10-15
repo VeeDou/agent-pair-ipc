@@ -30,3 +30,7 @@ Thumbs.db
 # Local review artifacts and reports
 docs/reports/*
 !docs/reports/.gitkeep
+
+# Local project session bindings
+.agent-pair/
+

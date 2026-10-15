@@ -16,12 +16,42 @@ import time
 from pathlib import Path
 
 from agent_pair_ipc.common import (
+    EXIT_CHANGES_REQUESTED,
+    EXIT_ERROR,
+    EXIT_NO_VERDICT,
+    EXIT_SIGN_OFF,
+    TailReader,
     attach_request_header,
     extract_nonce,
     extract_verdict,
     generate_nonce,
+    load_project_bindings,
     resolve_message_payload,
+    save_project_binding,
 )
+
+
+def resolve_target_session(target: str | None = None, cwd: str | None = None) -> tuple[str | None, str]:
+    """
+    Resolve target session through explicit binding priority chain:
+      1. Explicit CLI argument / flag (`-s <id_or_title>`)
+      2. Environment variable `AGENT_PAIR_CLAUDE_SESSION`
+      3. Project binding file `.agent-pair/bindings.json`
+      4. Auto-match fallback (returns None, "auto")
+    """
+    if target and target.strip():
+        return target.strip(), "cli_flag"
+
+    env_target = os.environ.get("AGENT_PAIR_CLAUDE_SESSION")
+    if env_target and env_target.strip():
+        return env_target.strip(), "env_var"
+
+    bindings = load_project_bindings(cwd)
+    bound = bindings.get("claude") or bindings.get("claude_session")
+    if bound and bound.strip():
+        return bound.strip(), "bindings_file"
+
+    return None, "auto"
 
 
 def find_transcript_path(cwd: str, session_id: str) -> str | None:
@@ -167,8 +197,10 @@ def match_session(
     if not candidates:
         return None
 
-    if target:
-        target_str = str(target).strip()
+    resolved_target, _ = resolve_target_session(target)
+
+    if resolved_target:
+        target_str = str(resolved_target).strip()
         # 1. Exact match on host_session_id
         for c in candidates:
             if c["host_session_id"] == target_str:
@@ -367,101 +399,83 @@ def send_and_wait(
     print(f"[Claude Code IPC] Waiting for Claude Code response (Req-ID: {nonce}, timeout: {int(timeout)}s)...", file=sys.stderr)
 
     start_time = time.time()
-    current_offset = initial_offset
     seen_tool_ids = set()
     found_request = False
     warned_idle = False
     warned_delivery = False
-    byte_buffer = b""
+    tail_reader = TailReader(transcript_path, start_offset=initial_offset)
 
     while time.time() - start_time < timeout:
         time.sleep(0.5)
 
-        if not transcript_path or not os.path.exists(transcript_path):
-            transcript_path = find_transcript_path(session.get("cwd", ""), session.get("session_id", ""))
-            if not transcript_path or not os.path.exists(transcript_path):
-                continue
-            session["transcript_path"] = transcript_path
-
         try:
-            file_size = os.path.getsize(transcript_path)
+            if not transcript_path or not os.path.exists(transcript_path):
+                transcript_path = find_transcript_path(session.get("cwd", ""), session.get("session_id", ""))
+                if not transcript_path or not os.path.exists(transcript_path):
+                    continue
+                session["transcript_path"] = transcript_path
+                tail_reader.set_file(transcript_path, start_offset=0)
+
             elapsed = time.time() - start_time
 
             if not found_request and elapsed > 25.0 and not warned_delivery:
                 warned_delivery = True
                 print(f"[Claude Code IPC] Notice: Request nonce {nonce} has not appeared in transcript after 25s. Peer session may be busy or inactive.", file=sys.stderr)
 
-            if file_size <= current_offset:
-                if session.get("entrypoint") == "claude-desktop" and not warned_idle and elapsed > 8.0:
-                    warned_idle = True
-                    print("[Claude Code IPC] Notice: Claude Desktop has not started processing yet. If window is in background, switch to it to wake it up.", file=sys.stderr)
-                continue
+            if session.get("entrypoint") == "claude-desktop" and not warned_idle and elapsed > 8.0 and not found_request:
+                warned_idle = True
+                print("[Claude Code IPC] Notice: Claude Desktop has not started processing yet. If window is in background, switch to it to wake it up.", file=sys.stderr)
 
-            with open(transcript_path, "rb") as f:
-                f.seek(current_offset)
-                chunk = f.read()
-                if not chunk:
+            for line in tail_reader.read_new_lines():
+                try:
+                    entry = json.loads(line)
+                    msg = entry.get("message", {})
+                    role = msg.get("role")
+
+                    # Step 1: Detect user message with our correlation nonce
+                    if role == "user":
+                        content_val = msg.get("content", "")
+                        raw_content = ""
+                        if isinstance(content_val, list):
+                            for p in content_val:
+                                if isinstance(p, dict) and p.get("type") == "text":
+                                    raw_content += p.get("text", "")
+                        elif isinstance(content_val, str):
+                            raw_content = content_val
+
+                        if nonce in raw_content:
+                            found_request = True
+                            if debug:
+                                print(f"[Claude Code IPC Debug] Found correlated user request with nonce {nonce}", file=sys.stderr)
+
+                    # Step 2: Once correlated request is identified, track assistant tools and final completion
+                    elif found_request and role == "assistant":
+                        # Live tool tracking
+                        if show_progress:
+                            for c in msg.get("content", []):
+                                if isinstance(c, dict) and c.get("type") == "tool_use":
+                                    tid = c.get("id")
+                                    tname = c.get("name")
+                                    if tid and tid not in seen_tool_ids:
+                                        seen_tool_ids.add(tid)
+                                        print(f"[Claude Code IPC] Running tool: {tname}...", file=sys.stderr)
+
+                        # Completion check
+                        stop_reason = msg.get("stop_reason")
+                        if stop_reason and stop_reason != "tool_use":
+                            texts = []
+                            for part in msg.get("content", []):
+                                if isinstance(part, dict) and part.get("type") == "text":
+                                    texts.append(part.get("text", ""))
+                            full_text = "\n".join(texts).strip()
+                            if full_text:
+                                verdict = extract_verdict(full_text)
+                                return full_text, verdict
+
+                except Exception as parse_err:
+                    if debug:
+                        print(f"[Claude Code IPC Debug] Error parsing line: {parse_err}", file=sys.stderr)
                     continue
-
-                current_offset += len(chunk)
-                combined = byte_buffer + chunk
-                raw_lines = combined.split(b"\n")
-                byte_buffer = raw_lines[-1]
-
-                for rline in raw_lines[:-1]:
-                    rline = rline.strip()
-                    if not rline:
-                        continue
-                    try:
-                        line = rline.decode("utf-8", errors="replace")
-                        entry = json.loads(line)
-                        msg = entry.get("message", {})
-                        role = msg.get("role")
-
-                        # Step 1: Detect user message with our correlation nonce
-                        if role == "user":
-                            content_val = msg.get("content", "")
-                            raw_content = ""
-                            if isinstance(content_val, list):
-                                for p in content_val:
-                                    if isinstance(p, dict) and p.get("type") == "text":
-                                        raw_content += p.get("text", "")
-                            elif isinstance(content_val, str):
-                                raw_content = content_val
-
-                            if nonce in raw_content:
-                                found_request = True
-                                if debug:
-                                    print(f"[Claude Code IPC Debug] Found correlated user request with nonce {nonce}", file=sys.stderr)
-
-                        # Step 2: Once correlated request is identified, track assistant tools and final completion
-                        elif found_request and role == "assistant":
-                            # Live tool tracking
-                            if show_progress:
-                                for c in msg.get("content", []):
-                                    if isinstance(c, dict) and c.get("type") == "tool_use":
-                                        tid = c.get("id")
-                                        tname = c.get("name")
-                                        if tid and tid not in seen_tool_ids:
-                                            seen_tool_ids.add(tid)
-                                            print(f"[Claude Code IPC] Running tool: {tname}...", file=sys.stderr)
-
-                            # Completion check
-                            stop_reason = msg.get("stop_reason")
-                            if stop_reason and stop_reason != "tool_use":
-                                texts = []
-                                for part in msg.get("content", []):
-                                    if isinstance(part, dict) and part.get("type") == "text":
-                                        texts.append(part.get("text", ""))
-                                full_text = "\n".join(texts).strip()
-                                if full_text:
-                                    verdict = extract_verdict(full_text)
-                                    return full_text, verdict
-
-                    except Exception as parse_err:
-                        if debug:
-                            print(f"[Claude Code IPC Debug] Error parsing line: {parse_err}", file=sys.stderr)
-                        continue
 
         except Exception as e:
             if debug:
@@ -523,6 +537,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("-f", "--file", dest="file_path", default=None, help="Path to file whose content should be sent as message")
     parser.add_argument("--prefix", dest="prefix", default=None, help="Optional text prefix to prepend before file/stdin content")
     parser.add_argument("-s", "--session", dest="session_target", default=None, help="Target session ID, hostSessionId, title/name, or PID")
+    parser.add_argument("--bind", dest="bind_target", default=None, help="Bind target session ID to current project in .agent-pair/bindings.json")
     parser.add_argument("-l", "--list", action="store_true", help="List all currently active and connectable Claude Code sessions")
     parser.add_argument("-r", "--read", action="store_true", help="Read the latest assistant feedback/response from the target session")
     parser.add_argument("-a", "--all-turns", action="store_true", help="Include intermediate tool-use turns when reading transcript (default: final turns only)")
@@ -537,9 +552,14 @@ def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
 
+    if args.bind_target:
+        bfile = save_project_binding("claude", args.bind_target)
+        print(f"[Claude Code IPC] Bound Claude Code session '{args.bind_target}' to {bfile}")
+        return EXIT_SIGN_OFF
+
     if args.list:
         list_sessions(debug=args.debug)
-        return 0
+        return EXIT_SIGN_OFF
 
     target = args.session_target
 
@@ -547,12 +567,12 @@ def main(argv: list[str] | None = None) -> int:
         target = target or args.target_pos or args.message
         feedback = read_latest_feedback(target=target, n=args.number, only_final=not args.all_turns)
         if not feedback:
-            return 1
+            return EXIT_ERROR
         for i, turn in enumerate(feedback):
             if len(feedback) > 1:
                 print(f"--- Turn {i+1} [{turn.get('timestamp')}] ---")
             print(turn["text"])
-        return 0
+        return EXIT_SIGN_OFF
 
     msg_text, resolved_target = resolve_message_payload(
         message_arg=args.message,
@@ -565,7 +585,7 @@ def main(argv: list[str] | None = None) -> int:
 
     if not msg_text:
         parser.print_help()
-        return 1
+        return EXIT_ERROR
 
     target = resolved_target
 
@@ -575,16 +595,16 @@ def main(argv: list[str] | None = None) -> int:
             print("\n=== [Claude Code Response] ===")
             print(resp)
             if verdict == "SIGN_OFF":
-                return 0
+                return EXIT_SIGN_OFF
             elif verdict == "CHANGES_REQUESTED":
-                return 2
+                return EXIT_CHANGES_REQUESTED
             else:
                 print("\n[Claude Code IPC] Note: No standardized VERDICT line (SIGN_OFF / CHANGES_REQUESTED) found.", file=sys.stderr)
-                return 3
-        return 1
+                return EXIT_NO_VERDICT
+        return EXIT_ERROR
 
     ok = send_message_to_claude(msg_text, target=target, debug=args.debug)
-    return 0 if ok else 1
+    return EXIT_SIGN_OFF if ok else EXIT_ERROR
 
 
 if __name__ == "__main__":

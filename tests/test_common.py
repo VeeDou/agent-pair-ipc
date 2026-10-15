@@ -6,11 +6,14 @@ import tempfile
 import unittest
 from pathlib import Path
 from agent_pair_ipc.common import (
-    resolve_message_payload,
-    generate_nonce,
+    TailReader,
     attach_request_header,
     extract_nonce,
     extract_verdict,
+    generate_nonce,
+    load_project_bindings,
+    resolve_message_payload,
+    save_project_binding,
 )
 
 
@@ -77,6 +80,53 @@ class TestCommon(unittest.TestCase):
         # Must be on its own line
         text = "I would normally write VERDICT: SIGN_OFF but here we have doubts."
         self.assertIsNone(extract_verdict(text))
+
+    def test_tail_reader_incremental_and_utf8_split(self):
+        with tempfile.NamedTemporaryFile("wb", delete=False) as tf:
+            tf_path = tf.name
+
+        try:
+            reader = TailReader(tf_path, start_offset=0)
+            self.assertEqual(reader.read_new_lines(), [])
+
+            # Write first line
+            with open(tf_path, "ab") as f:
+                f.write(b'{"turn": 1, "msg": "First"}\n')
+
+            lines = reader.read_new_lines()
+            self.assertEqual(len(lines), 1)
+            self.assertIn("First", lines[0])
+
+            # Write partial UTF-8 multi-byte chunk (Chinese character: 3 bytes: e6 b5 8b)
+            chinese_char = "测".encode("utf-8")
+            with open(tf_path, "ab") as f:
+                f.write(b'{"turn": 2, "msg": "' + chinese_char[:1])
+
+            # Incomplete line should not be returned yet
+            lines = reader.read_new_lines()
+            self.assertEqual(len(lines), 0)
+
+            # Write remaining bytes and complete the line
+            with open(tf_path, "ab") as f:
+                f.write(chinese_char[1:] + b'"}\n')
+
+            lines = reader.read_new_lines()
+            self.assertEqual(len(lines), 1)
+            self.assertIn("测", lines[0])
+        finally:
+            Path(tf_path).unlink(missing_ok=True)
+
+    def test_project_bindings_roundtrip(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            bindings = load_project_bindings(tmpdir)
+            self.assertEqual(bindings, {})
+
+            save_project_binding("codex", "sess_codex_123", cwd=tmpdir)
+            save_project_binding("claude", "sess_claude_456", cwd=tmpdir)
+
+            loaded = load_project_bindings(tmpdir)
+            self.assertEqual(loaded.get("codex"), "sess_codex_123")
+            self.assertEqual(loaded.get("claude"), "sess_claude_456")
 
 
 if __name__ == "__main__":

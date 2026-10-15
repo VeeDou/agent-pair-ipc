@@ -5,11 +5,105 @@ Provides helpers for message resolution, payload formatting, correlation nonces,
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import sys
 import uuid
 from pathlib import Path
+
+# Standardized Process Exit Codes
+EXIT_SIGN_OFF = 0
+EXIT_ERROR = 1
+EXIT_CHANGES_REQUESTED = 2
+EXIT_NO_VERDICT = 3
+EXIT_QUEUED_UNCONSUMED = 4
+
+
+class TailReader:
+    """
+    Incremental binary-safe tail reader for JSONL files.
+    Avoids O(N) full re-reads, safely handles multi-byte UTF-8 character splits,
+    and maintains buffer state across polls.
+    """
+
+    def __init__(self, file_path: str | Path | None = None, start_offset: int = 0):
+        self.file_path = str(file_path) if file_path else None
+        self.offset = start_offset
+        self.buffer = b""
+
+    def set_file(self, file_path: str | Path, start_offset: int = 0) -> None:
+        self.file_path = str(file_path)
+        self.offset = start_offset
+        self.buffer = b""
+
+    def read_new_lines(self) -> list[str]:
+        if not self.file_path or not os.path.exists(self.file_path):
+            return []
+        try:
+            size = os.path.getsize(self.file_path)
+            if size <= self.offset:
+                return []
+            with open(self.file_path, "rb") as f:
+                f.seek(self.offset)
+                chunk = f.read()
+                if not chunk:
+                    return []
+                self.offset += len(chunk)
+                combined = self.buffer + chunk
+                raw_lines = combined.split(b"\n")
+                self.buffer = raw_lines[-1]
+
+                lines = []
+                for rline in raw_lines[:-1]:
+                    rline = rline.strip()
+                    if rline:
+                        lines.append(rline.decode("utf-8", errors="replace"))
+                return lines
+        except Exception:
+            return []
+
+
+def find_project_bindings_file(cwd: str | None = None) -> Path | None:
+    """Find .agent-pair/bindings.json starting from cwd walking up parents."""
+    cur = Path(cwd or os.getcwd()).resolve()
+    for p in [cur] + list(cur.parents):
+        bindings = p / ".agent-pair" / "bindings.json"
+        if bindings.is_file():
+            return bindings
+    return None
+
+
+def load_project_bindings(cwd: str | None = None) -> dict[str, str]:
+    """Load session bindings for the current project."""
+    bfile = find_project_bindings_file(cwd)
+    if not bfile:
+        return {}
+    try:
+        with open(bfile, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def save_project_binding(agent_name: str, session_id: str, cwd: str | None = None) -> Path:
+    """Save target session binding for an agent into .agent-pair/bindings.json."""
+    base = Path(cwd or os.getcwd()).resolve()
+    target_dir = base / ".agent-pair"
+    target_dir.mkdir(parents=True, exist_ok=True)
+    target_file = target_dir / "bindings.json"
+    data = {}
+    if target_file.is_file():
+        try:
+            with open(target_file, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception:
+            data = {}
+    data[agent_name] = session_id
+    with open(target_file, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2, ensure_ascii=False)
+    return target_file
 
 
 def resolve_message_payload(
