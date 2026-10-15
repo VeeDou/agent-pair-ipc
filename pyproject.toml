@@ -1,0 +1,52 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "agent-pair-ipc"
+version = "0.1.0"
+description = "Zero-dependency local IPC & automated pair-review toolkit for Claude Code, Codex, and Antigravity."
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+authors = [
+    { name = "VeeDou", email = "ax65@live.com" }
+]
+keywords = [
+    "ai",
+    "agents",
+    "ipc",
+    "claude-code",
+    "codex",
+    "antigravity",
+    "pair-programming",
+    "code-review",
+    "automation"
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Software Development :: Build Tools",
+    "Topic :: Software Development :: Quality Assurance",
+]
+dependencies = []
+
+[project.urls]
+Homepage = "https://github.com/VeeDou/agent-pair-ipc"
+Repository = "https://github.com/VeeDou/agent-pair-ipc.git"
+Issues = "https://github.com/VeeDou/agent-pair-ipc/issues"
+
+[project.scripts]
+agent-pair-ipc = "agent_pair_ipc.cli:main"
+claude-ipc = "agent_pair_ipc.claude:main"
+codex-ipc = "agent_pair_ipc.codex:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["agent_pair_ipc*"]
