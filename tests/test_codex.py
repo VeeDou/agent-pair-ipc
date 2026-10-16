@@ -263,6 +263,60 @@ class TestCodex(unittest.TestCase):
                 self.assertIsNotNone(res)
                 self.assertEqual(res["id"], "new_sess_002")
 
+    def test_codex_send_file(self):
+        from agent_pair_ipc.codex import send_file
+
+        with tempfile.NamedTemporaryFile("w+", delete=False, suffix=".md") as tf:
+            tf.write("# Codex Audit Request\n- Test YAML content `rules: []`")
+            tf_path = tf.name
+
+        try:
+            with patch("agent_pair_ipc.codex.send_message_to_codex", return_value=True) as mock_send:
+                ok = send_file(tf_path, target="mock_thread_id")
+                self.assertTrue(ok)
+                self.assertTrue(mock_send.called)
+                sent_msg = mock_send.call_args[0][0]
+                self.assertIn("# Codex Audit Request", sent_msg)
+                self.assertIn("rules: []", sent_msg)
+        finally:
+            Path(tf_path).unlink(missing_ok=True)
+
+    def test_codex_dual_channel_reply_socket(self):
+        """Optimization 2 test for Codex: Ephemeral reply socket delivers response directly."""
+        import socket
+        from agent_pair_ipc.codex import send_and_wait
+        from agent_pair_ipc.common import extract_peer_envelope
+
+        fake_session = {
+            "id": "codex-socket-thread-123",
+            "name": "Socket Test Thread",
+            "cwd": "/fake/cwd",
+            "jsonl_path": "/nonexistent/rollout.jsonl",
+            "mtime": 100.0,
+        }
+
+        def mock_deliver(msg, **kwargs):
+            parsed = extract_peer_envelope(msg)
+            reply_sock = parsed.get("reply_socket")
+            if reply_sock:
+                s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                s.connect(reply_sock)
+                payload = json.dumps({
+                    "type": "response",
+                    "content": "Codex approved directly via callback channel.\n\nVERDICT: SIGN_OFF",
+                    "verdict": "SIGN_OFF",
+                })
+                s.sendall(payload.encode("utf-8"))
+                s.close()
+            return True
+
+        with patch("agent_pair_ipc.codex.match_session", return_value=(fake_session, "matched")), \
+             patch("agent_pair_ipc.codex.send_message_to_codex", side_effect=mock_deliver):
+            resp, verdict = send_and_wait("Review request", target="codex-socket-thread-123", timeout=5.0)
+            self.assertIsNotNone(resp)
+            self.assertIn("Codex approved directly via callback channel", resp)
+            self.assertEqual(verdict, "SIGN_OFF")
+
 
 if __name__ == "__main__":
     unittest.main()

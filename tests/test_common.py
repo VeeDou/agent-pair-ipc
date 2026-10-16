@@ -159,6 +159,121 @@ class TestCommon(unittest.TestCase):
             loaded = load_project_bindings(cwd=str(sub_dir))
             self.assertNotIn("codex", loaded)
 
+    def test_create_safe_payload_file(self):
+        import os
+        from agent_pair_ipc.common import create_safe_payload_file
+        content = "Line with `backticks` and $ENV and quotes \"'\"\n第二行中文字符"
+        path = create_safe_payload_file(content)
+        try:
+            self.assertTrue(os.path.exists(path))
+            # Verify permission mode is 0o600
+            st = os.stat(path)
+            mode = oct(st.st_mode & 0o777)
+            self.assertEqual(mode, "0o600")
+            # Verify content integrity
+            with open(path, "r", encoding="utf-8") as f:
+                read_back = f.read()
+            self.assertEqual(read_back, content)
+        finally:
+            if os.path.exists(path):
+                os.unlink(path)
+
+    def test_format_and_extract_peer_envelope(self):
+        from agent_pair_ipc.common import format_peer_envelope, extract_peer_envelope
+        nonce = "req_test12345"
+        body = "Please review my PR on `proxy.yaml`.\n\nThanks!"
+        envelope = format_peer_envelope(
+            message=body,
+            nonce=nonce,
+            sender="Antigravity",
+            intent="Read-Only Review",
+            user_context="User asked for audit",
+            reply_socket="/tmp/ap-reply-req_test12345.sock",
+        )
+        self.assertIn("【Agent 对等协作意图声明】", envelope)
+        self.assertIn("req_test12345", envelope)
+        self.assertIn("Read-Only Review", envelope)
+        self.assertIn("User asked for audit", envelope)
+        self.assertIn("/tmp/ap-reply-req_test12345.sock", envelope)
+        self.assertIn(body, envelope)
+
+        parsed = extract_peer_envelope(envelope)
+        self.assertEqual(parsed["nonce"], nonce)
+        self.assertEqual(parsed["sender"], "Antigravity")
+        self.assertEqual(parsed["intent"], "Read-Only Review")
+        self.assertEqual(parsed["user_context"], "User asked for audit")
+        self.assertEqual(parsed["reply_socket"], "/tmp/ap-reply-req_test12345.sock")
+        self.assertEqual(parsed["body"], body)
+
+    def test_ephemeral_reply_server_json(self):
+        import json
+        import os
+        import socket
+        from agent_pair_ipc.common import EphemeralReplyServer
+
+        nonce = "test_reply_json_99"
+        server = EphemeralReplyServer(nonce=nonce, timeout=5.0)
+        sock_path = server.start()
+        self.assertTrue(os.path.exists(sock_path))
+
+        try:
+            # Initially nothing
+            resp, verdict = server.poll_response(timeout=0.0)
+            self.assertIsNone(resp)
+            self.assertIsNone(verdict)
+
+            # Client connects and writes JSON response
+            client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            client.connect(sock_path)
+            payload = json.dumps({
+                "type": "response",
+                "content": "All tests passed cleanly.\n\nVERDICT: SIGN_OFF",
+                "verdict": "SIGN_OFF",
+            })
+            client.sendall(payload.encode("utf-8"))
+            client.close()
+
+            # Server polls response
+            resp, verdict = server.poll_response(timeout=2.0)
+            self.assertIsNotNone(resp)
+            self.assertIn("All tests passed cleanly", resp)
+            self.assertEqual(verdict, "SIGN_OFF")
+        finally:
+            server.close()
+            self.assertFalse(os.path.exists(sock_path))
+
+    def test_ephemeral_reply_server_plain_text(self):
+        import os
+        import socket
+        from agent_pair_ipc.common import EphemeralReplyServer
+
+        nonce = "test_reply_text_88"
+        with EphemeralReplyServer(nonce=nonce, timeout=5.0) as server:
+            sock_path = server.socket_path
+            self.assertTrue(os.path.exists(sock_path))
+
+            client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            client.connect(sock_path)
+            client.sendall(b"Found 1 bug.\n\nVERDICT: CHANGES_REQUESTED")
+            client.close()
+
+            resp, verdict = server.poll_response(timeout=2.0)
+            self.assertIsNotNone(resp)
+            self.assertEqual(verdict, "CHANGES_REQUESTED")
+
+        # After context exit, socket should be cleaned up
+        self.assertFalse(os.path.exists(sock_path))
+
+    def test_activate_desktop_app_mock(self):
+        from unittest.mock import patch, MagicMock
+        from agent_pair_ipc.common import activate_desktop_app
+
+        with patch("sys.platform", "darwin"), patch("subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(returncode=0)
+            ok = activate_desktop_app("Claude", new_tab=True)
+            self.assertTrue(ok)
+            self.assertEqual(mock_run.call_count, 2)
+
 
 if __name__ == "__main__":
     unittest.main()

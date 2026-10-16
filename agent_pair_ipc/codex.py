@@ -22,10 +22,16 @@ from agent_pair_ipc.common import (
     EXIT_NO_VERDICT,
     EXIT_QUEUED_UNCONSUMED,
     EXIT_SIGN_OFF,
+    EphemeralReplyServer,
     NeedsNewSessionError,
     TailReader,
+    activate_desktop_app,
     attach_request_header,
+    create_safe_payload_file,
+    extract_nonce,
+    extract_peer_envelope,
     extract_verdict,
+    format_peer_envelope,
     generate_nonce,
     load_project_bindings,
     resolve_message_payload,
@@ -258,6 +264,7 @@ def await_new_thread(
     timeout: float = 60.0,
     cwd: str | None = None,
     require_tty: bool = True,
+    activate_gui: bool = False,
     debug: bool = False,
 ) -> dict | None:
     """
@@ -272,6 +279,11 @@ def await_new_thread(
         print("[Codex IPC] Cannot interactively wait for new thread in non-interactive environment (non-TTY).", file=sys.stderr)
         print("👉 Please create a new thread in Codex Desktop, or run with -s <session_id>.", file=sys.stderr)
         raise NeedsNewSessionError("Cannot await new thread in non-TTY environment")
+
+    if activate_gui:
+        print("[Codex IPC] Activating Codex Desktop application...", file=sys.stderr)
+        if not activate_desktop_app("ChatGPT", new_tab=True):
+            activate_desktop_app("Codex", new_tab=True)
 
     watch_start = time.time()
     sessions_root = Path.home() / ".codex" / "sessions"
@@ -297,6 +309,10 @@ def await_new_thread(
 
     while time.time() - watch_start < timeout:
         time.sleep(0.5)
+        elapsed = int(time.time() - watch_start)
+        if sys.stderr.isatty():
+            print(f"\r[Codex IPC] [侦测中 {elapsed:02d}s / {int(timeout)}s] 等待 Codex Desktop 新建会话... (点击 New Thread)", end="", file=sys.stderr)
+
         for d in date_subdirs:
             if not d.is_dir():
                 continue
@@ -314,7 +330,9 @@ def await_new_thread(
                         continue
                     if meta.get("cwd") == target_cwd and meta.get("source") != "exec":
                         save_project_binding("codex", sid, cwd=target_cwd)
-                        print(f"[Codex IPC] Detected new thread [{sid}]! Automatically bound to .agent-pair/bindings.json.", file=sys.stderr)
+                        if sys.stderr.isatty():
+                            print("", file=sys.stderr)
+                        print(f"[Codex IPC] 监听到新会话诞生: [{sid}] -> 自动完成持久绑定！", file=sys.stderr)
                         return {
                             "id": sid,
                             "name": "New Thread",
@@ -330,6 +348,8 @@ def await_new_thread(
                     print(f"[Codex IPC Debug] Error polling new thread: {e}", file=sys.stderr)
                 continue
 
+    if sys.stderr.isatty():
+        print("", file=sys.stderr)
     print(f"[Codex IPC] Timed out waiting for new thread after {int(timeout)}s.", file=sys.stderr)
     return None
 
@@ -410,8 +430,11 @@ def read_latest_feedback(target: str | None = None, n: int = 1, only_final: bool
 def send_message_to_codex(
     message: str,
     target: str | None = None,
+    intent: str = "Read-Only Review",
+    user_context: str | None = None,
     pick_latest: bool = False,
     auto_await_new: bool = True,
+    activate_gui: bool = False,
     debug: bool = False,
 ) -> bool:
     """Send message to Codex session via `codex queue`."""
@@ -421,7 +444,7 @@ def send_message_to_codex(
             return False
         resolved_target, _ = resolve_target_session(target)
         if resolved_target is None and auto_await_new:
-            session = await_new_thread(timeout=60.0, cwd=os.getcwd(), debug=debug)
+            session = await_new_thread(timeout=60.0, cwd=os.getcwd(), activate_gui=activate_gui, debug=debug)
 
     if not session:
         if target:
@@ -433,6 +456,17 @@ def send_message_to_codex(
 
     session_id = session["id"]
     display_name = session.get("name") or session_id
+
+    # Wrap in Peer Envelope if not already wrapped
+    if not extract_nonce(message):
+        nonce = generate_nonce()
+        message = format_peer_envelope(
+            message=message,
+            nonce=nonce,
+            sender="Antigravity",
+            intent=intent,
+            user_context=user_context,
+        )
 
     try:
         cmd = ["codex", "queue", "--thread", session_id, "--message", message]
@@ -448,6 +482,64 @@ def send_message_to_codex(
         return False
 
 
+def send_file(
+    file_path: str | Path,
+    target: str | None = None,
+    prefix: str | None = None,
+    wait: bool = False,
+    timeout: float = 300.0,
+    fast_fail_timeout: float = 15.0,
+    intent: str = "Read-Only Review",
+    user_context: str | None = None,
+    pick_latest: bool = False,
+    auto_await_new: bool = True,
+    activate_gui: bool = False,
+    debug: bool = False,
+) -> bool | tuple[str | None, str | None]:
+    """
+    Safely send file content directly to Codex without command-line string escaping issues.
+    If wait is True, synchronously waits for the response and returns (response_text, verdict).
+    Otherwise, queues message asynchronously and returns True on success.
+    """
+    fpath = Path(file_path).expanduser().resolve()
+    if not fpath.is_file():
+        print(f"[Codex IPC] Error: file not found: {file_path}", file=sys.stderr)
+        return (None, None) if wait else False
+    try:
+        with open(fpath, "r", encoding="utf-8") as f:
+            content = f.read().strip()
+    except Exception as e:
+        print(f"[Codex IPC] Error reading {file_path}: {e}", file=sys.stderr)
+        return (None, None) if wait else False
+
+    if prefix:
+        content = f"{prefix.strip()}\n\n{content}"
+
+    if wait:
+        return send_and_wait(
+            content,
+            target=target,
+            timeout=timeout,
+            fast_fail_timeout=fast_fail_timeout,
+            intent=intent,
+            user_context=user_context,
+            pick_latest=pick_latest,
+            auto_await_new=auto_await_new,
+            activate_gui=activate_gui,
+            debug=debug,
+        )
+    return send_message_to_codex(
+        content,
+        target=target,
+        intent=intent,
+        user_context=user_context,
+        pick_latest=pick_latest,
+        auto_await_new=auto_await_new,
+        activate_gui=activate_gui,
+        debug=debug,
+    )
+
+
 def send_and_wait(
     message: str,
     target: str | None = None,
@@ -455,15 +547,18 @@ def send_and_wait(
     fast_fail_timeout: float = 15.0,
     show_progress: bool = True,
     sender_name: str = "Antigravity",
+    intent: str = "Read-Only Review",
+    user_context: str | None = None,
     pick_latest: bool = False,
     auto_await_new: bool = True,
+    activate_gui: bool = False,
     debug: bool = False,
 ) -> tuple[str | None, str | None]:
     """
     Send message to Codex with correlation nonce and wait synchronously.
-    Uses TailReader to eliminate multi-megabyte re-reads.
-    Implements fast fail: if nonce is not consumed after fast_fail_timeout,
-    exits with QUEUED_UNCONSUMED to prevent hanging on inactive desktop tabs.
+    Uses dual-channel listening:
+      1. Direct bi-directional Unix Domain Socket callback (/tmp/ap-reply-<nonce>.sock)
+      2. Incremental TailReader on JSONL rollout transcript with fast-fail detection
     
     Returns:
         tuple[response_text, verdict]
@@ -475,7 +570,7 @@ def send_and_wait(
         resolved_target, _ = resolve_target_session(target)
         if resolved_target is None and auto_await_new:
             try:
-                session = await_new_thread(timeout=60.0, cwd=os.getcwd(), debug=debug)
+                session = await_new_thread(timeout=60.0, cwd=os.getcwd(), activate_gui=activate_gui, debug=debug)
             except NeedsNewSessionError:
                 return None, "NEEDS_NEW_THREAD"
 
@@ -497,93 +592,129 @@ def send_and_wait(
         initial_offset = os.path.getsize(jsonl_path)
 
     nonce = generate_nonce()
-    full_message = attach_request_header(message, nonce=nonce, sender=sender_name)
+    reply_server = EphemeralReplyServer(nonce=nonce, timeout=timeout)
+    reply_sock_path = None
+    try:
+        reply_sock_path = reply_server.start()
+    except Exception as e:
+        if debug:
+            print(f"[Codex IPC Debug] Could not start ephemeral reply server: {e}", file=sys.stderr)
 
-    ok = send_message_to_codex(full_message, target=session["id"], pick_latest=pick_latest, auto_await_new=False, debug=debug)
-    if not ok:
-        return None, None
+    full_message = format_peer_envelope(
+        message=message,
+        nonce=nonce,
+        sender=sender_name,
+        intent=intent,
+        user_context=user_context,
+        reply_socket=reply_sock_path,
+    )
 
-    print(f"[Codex IPC] Waiting for Codex response (Req-ID: {nonce}, timeout: {int(timeout)}s)...", file=sys.stderr)
-    start_time = time.time()
-    seen_tool_ids = set()
-    found_request = False
-    tail_reader = TailReader(jsonl_path, start_offset=initial_offset)
+    try:
+        ok = send_message_to_codex(
+            full_message,
+            target=session["id"],
+            pick_latest=pick_latest,
+            auto_await_new=False,
+            activate_gui=False,
+            debug=debug,
+        )
+        if not ok:
+            return None, None
 
-    while time.time() - start_time < timeout:
-        time.sleep(0.5)
-        if not jsonl_path or not os.path.exists(jsonl_path):
-            p = find_session_file(session["id"])
-            if p:
-                jsonl_path = str(p)
-                session["jsonl_path"] = jsonl_path
-                tail_reader.set_file(jsonl_path, start_offset=0)
-            else:
-                continue
+        print(f"[Codex IPC] Waiting for Codex response (Req-ID: {nonce}, timeout: {int(timeout)}s)...", file=sys.stderr)
+        start_time = time.time()
+        seen_tool_ids = set()
+        found_request = False
+        tail_reader = TailReader(jsonl_path, start_offset=initial_offset)
 
-        elapsed = time.time() - start_time
+        while time.time() - start_time < timeout:
+            time.sleep(0.5)
 
-        # Fast Fail: Nonce not consumed after fast_fail_timeout
-        if not found_request and elapsed > fast_fail_timeout:
-            print(f"\n[Codex IPC] Notice: Message is queued but was not consumed within {int(fast_fail_timeout)}s (Req-ID: {nonce}).", file=sys.stderr)
-            print(f"[Codex IPC] Target session \"{session.get('name')}\" [{session['id']}] might be inactive or busy executing another task.", file=sys.stderr)
-            print("[Codex IPC] NOTE: The message remains safely in Codex's internal queue; do NOT resend duplicate messages.", file=sys.stderr)
-            print(f"[Codex IPC] Action: Switch to Codex Desktop and activate session \"{session.get('name')}\", or run `codex-ipc -r` later to check for completion.\n", file=sys.stderr)
-            return None, "QUEUED_UNCONSUMED"
-
-        new_lines = tail_reader.read_new_lines()
-        for line in new_lines:
-            try:
-                entry = json.loads(line)
-                etype = entry.get("type")
-                payload = entry.get("payload", {})
-
-                # Step 1: Detect user queue/input message containing nonce
-                if nonce in line:
-                    found_request = True
+            # Dual-Channel 1: Check ephemeral reply socket first (direct bidirectional callback)
+            if reply_server:
+                r_resp, r_verdict = reply_server.poll_response(timeout=0.0)
+                if r_resp is not None:
                     if debug:
-                        print(f"[Codex IPC Debug] Detected correlated request with nonce {nonce}", file=sys.stderr)
+                        print(f"[Codex IPC Debug] Response received via ephemeral reply socket: {reply_sock_path}", file=sys.stderr)
+                    return r_resp, r_verdict
 
-                # Step 2: Track activity once request is queued
-                if found_request and show_progress:
-                    ptype = payload.get("type")
-                    if etype == "response_item" and ptype in ("custom_tool_call", "function_call"):
-                        call_id = payload.get("call_id") or payload.get("id")
-                        tool_name = payload.get("name", "tool")
-                        if call_id and call_id not in seen_tool_ids:
-                            seen_tool_ids.add(call_id)
-                            print(f"[Codex IPC Activity] Running tool: {tool_name}...", file=sys.stderr)
-                    elif payload.get("type") == "item_completed":
-                        item = payload.get("item", {})
-                        if item.get("type") == "Reasoning":
-                            rid = item.get("id")
-                            if rid and rid not in seen_tool_ids:
-                                seen_tool_ids.add(rid)
-                                print("[Codex IPC Activity] Reasoning in progress...", file=sys.stderr)
+            # Dual-Channel 2: Incremental JSONL transcript reading
+            if not jsonl_path or not os.path.exists(jsonl_path):
+                p = find_session_file(session["id"])
+                if p:
+                    jsonl_path = str(p)
+                    session["jsonl_path"] = jsonl_path
+                    tail_reader.set_file(jsonl_path, start_offset=0)
+                else:
+                    continue
 
-                # Step 3: Detect completion
-                if found_request:
-                    if etype == "event_msg" and payload.get("type") == "task_complete":
-                        last_msg = payload.get("last_agent_message")
-                        if last_msg:
-                            verdict = extract_verdict(last_msg)
-                            return last_msg.strip(), verdict
+            elapsed = time.time() - start_time
 
-                    elif etype == "response_item" and payload.get("type") == "message":
-                        if payload.get("role") == "assistant" and payload.get("phase") == "final_answer":
-                            content = payload.get("content", [])
-                            texts = [c.get("text", "") for c in content if c.get("type") in ("output_text", "Text")]
-                            full_text = "\n".join(texts).strip()
-                            if full_text:
-                                verdict = extract_verdict(full_text)
-                                return full_text, verdict
+            # Fast Fail: Nonce not consumed after fast_fail_timeout
+            if not found_request and elapsed > fast_fail_timeout:
+                print(f"\n[Codex IPC] Notice: Message is queued but was not consumed within {int(fast_fail_timeout)}s (Req-ID: {nonce}).", file=sys.stderr)
+                print(f"[Codex IPC] Target session \"{session.get('name')}\" [{session['id']}] might be inactive or busy executing another task.", file=sys.stderr)
+                print("[Codex IPC] NOTE: The message remains safely in Codex's internal queue; do NOT resend duplicate messages.", file=sys.stderr)
+                print(f"[Codex IPC] Action: Switch to Codex Desktop and activate session \"{session.get('name')}\", or run `codex-ipc -r` later to check for completion.\n", file=sys.stderr)
+                return None, "QUEUED_UNCONSUMED"
 
-            except Exception as parse_err:
-                if debug:
-                    print(f"[Codex IPC Debug] Parse error: {parse_err}", file=sys.stderr)
-                continue
+            new_lines = tail_reader.read_new_lines()
+            for line in new_lines:
+                try:
+                    entry = json.loads(line)
+                    etype = entry.get("type")
+                    payload = entry.get("payload", {})
 
-    print(f"[Codex IPC] Timed out waiting for response after {int(timeout)}s (Req-ID: {nonce}).", file=sys.stderr)
-    return None, None
+                    # Step 1: Detect user queue/input message containing nonce
+                    if nonce in line:
+                        found_request = True
+                        if debug:
+                            print(f"[Codex IPC Debug] Detected correlated request with nonce {nonce}", file=sys.stderr)
+
+                    # Step 2: Track activity once request is queued
+                    if found_request and show_progress:
+                        ptype = payload.get("type")
+                        if etype == "response_item" and ptype in ("custom_tool_call", "function_call"):
+                            call_id = payload.get("call_id") or payload.get("id")
+                            tool_name = payload.get("name", "tool")
+                            if call_id and call_id not in seen_tool_ids:
+                                seen_tool_ids.add(call_id)
+                                print(f"[Codex IPC Activity] Running tool: {tool_name}...", file=sys.stderr)
+                        elif payload.get("type") == "item_completed":
+                            item = payload.get("item", {})
+                            if item.get("type") == "Reasoning":
+                                rid = item.get("id")
+                                if rid and rid not in seen_tool_ids:
+                                    seen_tool_ids.add(rid)
+                                    print("[Codex IPC Activity] Reasoning in progress...", file=sys.stderr)
+
+                    # Step 3: Detect completion
+                    if found_request:
+                        if etype == "event_msg" and payload.get("type") == "task_complete":
+                            last_msg = payload.get("last_agent_message")
+                            if last_msg:
+                                verdict = extract_verdict(last_msg)
+                                return last_msg.strip(), verdict
+
+                        elif etype == "response_item" and payload.get("type") == "message":
+                            if payload.get("role") == "assistant" and payload.get("phase") == "final_answer":
+                                content = payload.get("content", [])
+                                texts = [c.get("text", "") for c in content if c.get("type") in ("output_text", "Text")]
+                                full_text = "\n".join(texts).strip()
+                                if full_text:
+                                    verdict = extract_verdict(full_text)
+                                    return full_text, verdict
+
+                except Exception as parse_err:
+                    if debug:
+                        print(f"[Codex IPC Debug] Parse error: {parse_err}", file=sys.stderr)
+                    continue
+
+        print(f"[Codex IPC] Timed out waiting for response after {int(timeout)}s (Req-ID: {nonce}).", file=sys.stderr)
+        return None, None
+    finally:
+        if reply_server:
+            reply_server.close()
 
 
 def list_sessions(debug: bool = False):
@@ -657,6 +788,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("-r", "--read", action="store_true", help="Read the latest assistant feedback/response from target session")
     parser.add_argument("-a", "--all-turns", action="store_true", help="Include intermediate turns when reading transcript (default: final turns only)")
     parser.add_argument("-n", "--number", type=int, default=1, help="Number of assistant turns to read (default: 1)")
+    parser.add_argument("-g", "--activate-gui", action="store_true", help="Activate Codex Desktop application (and open new tab if creating new session)")
+    parser.add_argument("--intent", default="Read-Only Review", help="Peer cooperation intent declaration (default: 'Read-Only Review')")
+    parser.add_argument("--user-context", default=None, help="User prompt authorization context to pass in peer envelope")
     parser.add_argument("-w", "--wait", action="store_true", help="Send message and synchronously wait for Codex response")
     parser.add_argument("-t", "--timeout", type=float, default=300.0, help="Wait timeout in seconds (default: 300)")
     parser.add_argument("--fast-fail", type=float, default=15.0, help="Fast fail timeout in seconds if nonce not consumed (default: 15.0)")
@@ -700,7 +834,7 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.await_new_thread:
         try:
-            new_sess = await_new_thread(timeout=60.0, require_tty=False, debug=args.debug)
+            new_sess = await_new_thread(timeout=60.0, require_tty=False, activate_gui=args.activate_gui, debug=args.debug)
             if not new_sess:
                 return EXIT_ERROR
             target = new_sess["id"]
@@ -728,8 +862,11 @@ def main(argv: list[str] | None = None) -> int:
             target=target,
             timeout=args.timeout,
             fast_fail_timeout=args.fast_fail,
+            intent=args.intent,
+            user_context=args.user_context,
             pick_latest=args.pick_latest,
             auto_await_new=not args.no_auto_new,
+            activate_gui=args.activate_gui,
             debug=args.debug,
         )
         if verdict == "QUEUED_UNCONSUMED":
@@ -752,8 +889,11 @@ def main(argv: list[str] | None = None) -> int:
         ok = send_message_to_codex(
             msg_text,
             target=target,
+            intent=args.intent,
+            user_context=args.user_context,
             pick_latest=args.pick_latest,
             auto_await_new=not args.no_auto_new,
+            activate_gui=args.activate_gui,
             debug=args.debug,
         )
         return EXIT_SIGN_OFF if ok else EXIT_ERROR

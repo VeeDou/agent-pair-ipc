@@ -21,11 +21,16 @@ from agent_pair_ipc.common import (
     EXIT_NEEDS_NEW_THREAD,
     EXIT_NO_VERDICT,
     EXIT_SIGN_OFF,
+    EphemeralReplyServer,
     NeedsNewSessionError,
     TailReader,
+    activate_desktop_app,
     attach_request_header,
+    create_safe_payload_file,
     extract_nonce,
+    extract_peer_envelope,
     extract_verdict,
+    format_peer_envelope,
     generate_nonce,
     load_project_bindings,
     resolve_message_payload,
@@ -281,6 +286,7 @@ def await_new_session(
     timeout: float = 60.0,
     cwd: str | None = None,
     require_tty: bool = True,
+    activate_gui: bool = False,
     debug: bool = False,
 ) -> dict | None:
     """
@@ -295,6 +301,11 @@ def await_new_session(
         print("[Claude Code IPC] Cannot interactively wait for new session in non-interactive environment (non-TTY).", file=sys.stderr)
         print("👉 Please open project in Claude Desktop or run `claude` in terminal, or run with -s <session_id>.", file=sys.stderr)
         raise NeedsNewSessionError("Cannot await new session in non-TTY environment")
+
+    if activate_gui:
+        print("[Claude Code IPC] Activating Claude Desktop application...", file=sys.stderr)
+        if activate_desktop_app("Claude", new_tab=True):
+            print("[Claude Code IPC] Activated Claude Desktop with new tab (Cmd+T).", file=sys.stderr)
 
     watch_start = time.time()
     print(f"[Claude Code IPC] Waiting for Claude Code session for '{target_cwd}'... (Open project in Claude Desktop or run `claude` in terminal)", file=sys.stderr)
@@ -312,6 +323,10 @@ def await_new_session(
 
     while time.time() - watch_start < timeout:
         time.sleep(1.0)
+        elapsed = int(time.time() - watch_start)
+        if sys.stderr.isatty():
+            print(f"\r[Claude Code IPC] [侦测中 {elapsed:02d}s / {int(timeout)}s] 等待 Claude Desktop 新建会话... (按 Cmd+T 或 New Chat)", end="", file=sys.stderr)
+
         sessions = get_active_sessions(exclude_self=True, debug=debug)
         for s in sessions:
             if s.get("cwd") == target_cwd:
@@ -323,9 +338,13 @@ def await_new_session(
                 bind_id = s.get("host_session_id") or s.get("session_id")
                 if bind_id:
                     save_project_binding("claude", bind_id, cwd=target_cwd)
-                    print(f"[Claude Code IPC] Detected new session [{bind_id}]! Automatically bound to .agent-pair/bindings.json.", file=sys.stderr)
+                    if sys.stderr.isatty():
+                        print("", file=sys.stderr)
+                    print(f"[Claude Code IPC] 监听到新会话诞生: PID {s.get('pid')} [{bind_id}] -> 自动完成持久绑定！", file=sys.stderr)
                 return s
 
+    if sys.stderr.isatty():
+        print("", file=sys.stderr)
     print(f"[Claude Code IPC] Timed out waiting for Claude Code session after {int(timeout)}s.", file=sys.stderr)
     return None
 
@@ -333,8 +352,11 @@ def await_new_session(
 def send_message_to_claude(
     message: str,
     target: str | None = None,
+    intent: str = "Read-Only Review",
+    user_context: str | None = None,
     pick_latest: bool = False,
     auto_await_new: bool = True,
+    activate_gui: bool = False,
     debug: bool = False,
 ) -> bool:
     """Send message to target Claude Code session via Unix Domain Socket."""
@@ -346,7 +368,7 @@ def send_message_to_claude(
             return False
         resolved_target, _ = resolve_target_session(target)
         if resolved_target is None and auto_await_new:
-            session = await_new_session(timeout=60.0, cwd=os.getcwd(), debug=debug)
+            session = await_new_session(timeout=60.0, cwd=os.getcwd(), activate_gui=activate_gui, debug=debug)
 
     if not session:
         if target:
@@ -358,6 +380,17 @@ def send_message_to_claude(
 
     sock_path = session["socket_path"]
     token = session["token"]
+
+    # Wrap in Peer Envelope if not already wrapped
+    if not extract_nonce(message):
+        nonce = generate_nonce()
+        message = format_peer_envelope(
+            message=message,
+            nonce=nonce,
+            sender="Antigravity",
+            intent=intent,
+            user_context=user_context,
+        )
 
     try:
         s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -387,6 +420,62 @@ def send_message_to_claude(
     except Exception as e:
         print(f"[Claude Code IPC] Failed to send message to socket {sock_path}: {e}", file=sys.stderr)
         return False
+
+
+def send_file(
+    file_path: str | Path,
+    target: str | None = None,
+    prefix: str | None = None,
+    wait: bool = False,
+    timeout: float = 300.0,
+    intent: str = "Read-Only Review",
+    user_context: str | None = None,
+    pick_latest: bool = False,
+    auto_await_new: bool = True,
+    activate_gui: bool = False,
+    debug: bool = False,
+) -> bool | tuple[str | None, str | None]:
+    """
+    Safely send file content directly to Claude Code without command-line string escaping issues.
+    If wait is True, synchronously waits for the response and returns (response_text, verdict).
+    Otherwise, sends asynchronously and returns True on success.
+    """
+    fpath = Path(file_path).expanduser().resolve()
+    if not fpath.is_file():
+        print(f"[Claude Code IPC] Error: file not found: {file_path}", file=sys.stderr)
+        return (None, None) if wait else False
+    try:
+        with open(fpath, "r", encoding="utf-8") as f:
+            content = f.read().strip()
+    except Exception as e:
+        print(f"[Claude Code IPC] Error reading {file_path}: {e}", file=sys.stderr)
+        return (None, None) if wait else False
+
+    if prefix:
+        content = f"{prefix.strip()}\n\n{content}"
+
+    if wait:
+        return send_and_wait(
+            content,
+            target=target,
+            timeout=timeout,
+            intent=intent,
+            user_context=user_context,
+            pick_latest=pick_latest,
+            auto_await_new=auto_await_new,
+            activate_gui=activate_gui,
+            debug=debug,
+        )
+    return send_message_to_claude(
+        content,
+        target=target,
+        intent=intent,
+        user_context=user_context,
+        pick_latest=pick_latest,
+        auto_await_new=auto_await_new,
+        activate_gui=activate_gui,
+        debug=debug,
+    )
 
 
 def read_transcript_messages(transcript_path: str | None, last_n: int = 1, only_final: bool = True) -> list[dict]:
@@ -453,13 +542,18 @@ def send_and_wait(
     timeout: float = 300.0,
     show_progress: bool = True,
     sender_name: str = "Antigravity",
+    intent: str = "Read-Only Review",
+    user_context: str | None = None,
     pick_latest: bool = False,
     auto_await_new: bool = True,
+    activate_gui: bool = False,
     debug: bool = False,
 ) -> tuple[str | None, str | None]:
     """
     Send message to Claude Code with request correlation nonce and wait synchronously.
-    Uses incremental tailing (seeking to offset) to eliminate massive multi-megabyte re-reads.
+    Uses dual-channel listening:
+      1. Direct bi-directional Unix Domain Socket callback (/tmp/ap-reply-<nonce>.sock)
+      2. Incremental TailReader on JSONL transcript
     
     Returns:
         tuple[response_text, verdict]
@@ -473,7 +567,7 @@ def send_and_wait(
         resolved_target, _ = resolve_target_session(target)
         if resolved_target is None and auto_await_new:
             try:
-                session = await_new_session(timeout=60.0, cwd=os.getcwd(), debug=debug)
+                session = await_new_session(timeout=60.0, cwd=os.getcwd(), activate_gui=activate_gui, debug=debug)
             except NeedsNewSessionError:
                 return None, "NEEDS_NEW_THREAD"
 
@@ -490,27 +584,57 @@ def send_and_wait(
     if transcript_path and os.path.exists(transcript_path):
         initial_offset = os.path.getsize(transcript_path)
 
-    # Attach unique correlation nonce and sender identity
+    # Attach unique correlation nonce and start ephemeral reply server
     nonce = generate_nonce()
-    full_message = attach_request_header(message, nonce=nonce, sender=sender_name)
+    reply_server = EphemeralReplyServer(nonce=nonce, timeout=timeout)
+    reply_sock_path = None
+    try:
+        reply_sock_path = reply_server.start()
+    except Exception as e:
+        if debug:
+            print(f"[Claude Code IPC Debug] Could not start ephemeral reply server: {e}", file=sys.stderr)
 
-    ok = send_message_to_claude(full_message, target=session["host_session_id"] or str(session["pid"]), pick_latest=pick_latest, auto_await_new=False, debug=debug)
-    if not ok:
-        return None, None
+    full_message = format_peer_envelope(
+        message=message,
+        nonce=nonce,
+        sender=sender_name,
+        intent=intent,
+        user_context=user_context,
+        reply_socket=reply_sock_path,
+    )
 
-    print(f"[Claude Code IPC] Waiting for Claude Code response (Req-ID: {nonce}, timeout: {int(timeout)}s)...", file=sys.stderr)
+    try:
+        ok = send_message_to_claude(
+            full_message,
+            target=session["host_session_id"] or str(session["pid"]),
+            pick_latest=pick_latest,
+            auto_await_new=False,
+            activate_gui=False,
+            debug=debug,
+        )
+        if not ok:
+            return None, None
 
-    start_time = time.time()
-    seen_tool_ids = set()
-    found_request = False
-    warned_idle = False
-    warned_delivery = False
-    tail_reader = TailReader(transcript_path, start_offset=initial_offset)
+        print(f"[Claude Code IPC] Waiting for Claude Code response (Req-ID: {nonce}, timeout: {int(timeout)}s)...", file=sys.stderr)
 
-    while time.time() - start_time < timeout:
-        time.sleep(0.5)
+        start_time = time.time()
+        seen_tool_ids = set()
+        found_request = False
+        warned_idle = False
+        warned_delivery = False
+        tail_reader = TailReader(transcript_path, start_offset=initial_offset)
 
-        try:
+        while time.time() - start_time < timeout:
+            time.sleep(0.5)
+
+            # Dual-Channel 1: Check ephemeral reply socket first (direct bidirectional callback)
+            if reply_server:
+                r_resp, r_verdict = reply_server.poll_response(timeout=0.0)
+                if r_resp is not None:
+                    if debug:
+                        print(f"[Claude Code IPC Debug] Response received via ephemeral reply socket: {reply_sock_path}", file=sys.stderr)
+                    return r_resp, r_verdict
+
             if not transcript_path or not os.path.exists(transcript_path):
                 transcript_path = find_transcript_path(session.get("cwd", ""), session.get("session_id", ""))
                 if not transcript_path or not os.path.exists(transcript_path):
@@ -579,12 +703,11 @@ def send_and_wait(
                         print(f"[Claude Code IPC Debug] Error parsing line: {parse_err}", file=sys.stderr)
                     continue
 
-        except Exception as e:
-            if debug:
-                print(f"[Claude Code IPC Debug] Error in polling loop: {e}", file=sys.stderr)
-
-    print(f"[Claude Code IPC] Timed out waiting for response after {int(timeout)}s (Req-ID: {nonce}).", file=sys.stderr)
-    return None, None
+        print(f"[Claude Code IPC] Timed out waiting for response after {int(timeout)}s (Req-ID: {nonce}).", file=sys.stderr)
+        return None, None
+    finally:
+        if reply_server:
+            reply_server.close()
 
 
 def list_sessions(candidates: list[dict] | None = None, debug: bool = False):
@@ -654,6 +777,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("-r", "--read", action="store_true", help="Read the latest assistant feedback/response from the target session")
     parser.add_argument("-a", "--all-turns", action="store_true", help="Include intermediate tool-use turns when reading transcript (default: final turns only)")
     parser.add_argument("-n", "--number", type=int, default=1, help="Number of assistant turns to read (default: 1)")
+    parser.add_argument("-g", "--activate-gui", action="store_true", help="Activate Claude Desktop application (and open new tab if creating new session)")
+    parser.add_argument("--intent", default="Read-Only Review", help="Peer cooperation intent declaration (default: 'Read-Only Review')")
+    parser.add_argument("--user-context", default=None, help="User prompt authorization context to pass in peer envelope")
     parser.add_argument("-w", "--wait", action="store_true", help="Send message and synchronously wait for Claude Code's response")
     parser.add_argument("-t", "--timeout", type=float, default=300.0, help="Wait timeout in seconds (default: 300)")
     parser.add_argument("--debug", action="store_true", help="Enable verbose debug logs")
@@ -695,7 +821,7 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.await_new_session:
         try:
-            new_sess = await_new_session(timeout=60.0, require_tty=False, debug=args.debug)
+            new_sess = await_new_session(timeout=60.0, require_tty=False, activate_gui=args.activate_gui, debug=args.debug)
             if not new_sess:
                 return EXIT_ERROR
             target = new_sess.get("host_session_id") or new_sess.get("session_id") or str(new_sess["pid"])
@@ -722,8 +848,11 @@ def main(argv: list[str] | None = None) -> int:
             msg_text,
             target=target,
             timeout=args.timeout,
+            intent=args.intent,
+            user_context=args.user_context,
             pick_latest=args.pick_latest,
             auto_await_new=not args.no_auto_new,
+            activate_gui=args.activate_gui,
             debug=args.debug,
         )
         if verdict == "NEEDS_NEW_THREAD":
@@ -744,8 +873,11 @@ def main(argv: list[str] | None = None) -> int:
         ok = send_message_to_claude(
             msg_text,
             target=target,
+            intent=args.intent,
+            user_context=args.user_context,
             pick_latest=args.pick_latest,
             auto_await_new=not args.no_auto_new,
+            activate_gui=args.activate_gui,
             debug=args.debug,
         )
         return EXIT_SIGN_OFF if ok else EXIT_ERROR

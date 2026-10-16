@@ -188,6 +188,69 @@ class TestClaude(unittest.TestCase):
                 code = main(["-w", "-m", "Hello"])
                 self.assertEqual(code, EXIT_NEEDS_NEW_THREAD)
 
+    def test_claude_send_file(self):
+        import tempfile
+        from unittest.mock import patch
+        from agent_pair_ipc.claude import send_file
+
+        with tempfile.NamedTemporaryFile("w+", delete=False, suffix=".md") as tf:
+            tf.write("# Test Review File\nWith code block `let x = 1;`")
+            tf_path = tf.name
+
+        try:
+            with patch("agent_pair_ipc.claude.send_message_to_claude", return_value=True) as mock_send:
+                ok = send_file(tf_path, target="mock_sess")
+                self.assertTrue(ok)
+                self.assertTrue(mock_send.called)
+                sent_msg = mock_send.call_args[0][0]
+                self.assertIn("# Test Review File", sent_msg)
+                self.assertIn("let x = 1;", sent_msg)
+        finally:
+            Path(tf_path).unlink(missing_ok=True)
+
+    def test_claude_dual_channel_reply_socket(self):
+        """Optimization 2 test: Ephemeral reply socket delivers response directly without transcript."""
+        import json
+        import socket
+        from unittest.mock import patch
+        from agent_pair_ipc.claude import send_and_wait
+        from agent_pair_ipc.common import extract_peer_envelope
+
+        fake_session = {
+            "pid": 55555,
+            "session_id": "sess-socket-reply",
+            "host_session_id": "host-socket-reply",
+            "cwd": "/fake/cwd",
+            "socket_path": "/fake/sock",
+            "token": "tok123",
+            "transcript_path": "/nonexistent/transcript.jsonl",
+            "mtime": 100.0,
+        }
+
+        def mock_deliver(msg, **kwargs):
+            # Inspect envelope and reply directly via the advertised reply_socket
+            parsed = extract_peer_envelope(msg)
+            reply_sock = parsed.get("reply_socket")
+            if reply_sock:
+                s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                s.connect(reply_sock)
+                payload = json.dumps({
+                    "type": "response",
+                    "content": "Peer review approved directly via socket.\n\nVERDICT: SIGN_OFF",
+                    "verdict": "SIGN_OFF",
+                })
+                s.sendall(payload.encode("utf-8"))
+                s.close()
+            return True
+
+        with patch("agent_pair_ipc.claude.get_active_sessions", return_value=[fake_session]), \
+             patch("agent_pair_ipc.claude.match_session", return_value=(fake_session, "matched")), \
+             patch("agent_pair_ipc.claude.send_message_to_claude", side_effect=mock_deliver):
+            resp, verdict = send_and_wait("Hello Claude", target="host-socket-reply", timeout=5.0)
+            self.assertIsNotNone(resp)
+            self.assertIn("Peer review approved directly via socket", resp)
+            self.assertEqual(verdict, "SIGN_OFF")
+
 
 if __name__ == "__main__":
     unittest.main()
