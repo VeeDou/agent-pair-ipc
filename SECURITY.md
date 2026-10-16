@@ -20,6 +20,16 @@ Because these agents operate with shell execution (`bash`), file read/write, and
 3. **Session Re-use vs. Ephemeral Execution**:
    - By design, `agent-pair-ipc` connects to an *existing, active* user session rather than spawning an unmonitored background process. This ensures the human developer maintains full visual observation in the desktop or terminal UI.
 
+4. **Ephemeral Reply Socket Boundary**:
+   - Bi-directional callback sockets are established under `~/.agent-pair/run/` with strict directory permissions (`0o700`) and socket permissions (`0o600`).
+   - This prevents unprivileged local OS users from eavesdropping or injecting replies.
+   - *Note*: Other processes running under the same OS user share identical POSIX permissions and could technically write to the socket or transcript file. This is consistent with local IPC threat models.
+
+5. **macOS GUI Automation & Accessibility (Experimental)**:
+   - `activate_desktop_app(..., new_tab=True)` attempts to trigger `Cmd+T` via AppleScript / System Events to open new session tabs in desktop applications.
+   - This feature requires explicit macOS Accessibility permissions for the calling process.
+   - It is marked as **experimental** across varying client desktop UI states, though focus-verification loops are enforced before issuing keystrokes to prevent delivery to unintended windows.
+
 ## 3. Reporting Security Issues
 
 Please **do not report security vulnerabilities through public GitHub issues**.
