@@ -151,7 +151,7 @@ class TestClaude(unittest.TestCase):
         fake_session = {
             "pid": 99999,
             "session_id": "uuid-sess-1234",
-            "host_session_id": "local_bec81a52-3f90-4199-a1ac-ed3b3290588d",
+            "host_session_id": "local_mock_session_id_12345",
             "cwd": os.getcwd(),
         }
 
@@ -164,7 +164,7 @@ class TestClaude(unittest.TestCase):
             # Bound value must be host_session_id, NOT raw PID 99999
             agent_arg, bound_arg = mock_save.call_args[0][:2]
             self.assertEqual(agent_arg, "claude")
-            self.assertEqual(bound_arg, "local_bec81a52-3f90-4199-a1ac-ed3b3290588d")
+            self.assertEqual(bound_arg, "local_mock_session_id_12345")
             self.assertNotEqual(bound_arg, "99999")
 
     def test_claude_non_tty_auto_await_exits_with_needs_new_thread(self):

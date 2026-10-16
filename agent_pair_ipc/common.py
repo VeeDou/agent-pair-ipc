@@ -9,6 +9,7 @@ import json
 import os
 import re
 import sys
+import tempfile
 import uuid
 from pathlib import Path
 
@@ -215,14 +216,40 @@ def generate_nonce() -> str:
     return f"req_{uuid.uuid4().hex[:12]}"
 
 
+def get_secure_run_dir() -> Path:
+    """
+    Get or create secure runtime directory for sockets and ephemeral IPC files.
+    Prefers ~/.agent-pair/run with mode 0o700.
+    Falls back to <tempdir>/agent-pair-<uid> with mode 0o700 if home is not accessible.
+    """
+    try:
+        run_dir = Path.home() / ".agent-pair" / "run"
+        run_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            os.chmod(run_dir, 0o700)
+        except Exception:
+            pass
+        return run_dir
+    except Exception:
+        uid = os.getuid() if hasattr(os, "getuid") else "shared"
+        tmp_run = Path(tempfile.gettempdir()) / f"agent-pair-{uid}"
+        tmp_run.mkdir(parents=True, exist_ok=True)
+        try:
+            os.chmod(tmp_run, 0o700)
+        except Exception:
+            pass
+        return tmp_run
+
+
 def create_safe_payload_file(content: str, prefix: str = "ap_payload_", suffix: str = ".md") -> str:
     """
-    Safely create an ephemeral payload file with strict permissions (0o600).
+    Safely create an ephemeral payload file with strict permissions (0o600)
+    in the user-private runtime directory (~/.agent-pair/run).
     Avoids shell quoting and argument-length limitations.
     Returns the absolute file path.
     """
-    import tempfile
-    fd, path = tempfile.mkstemp(prefix=prefix, suffix=suffix)
+    run_dir = get_secure_run_dir()
+    fd, path = tempfile.mkstemp(prefix=prefix, suffix=suffix, dir=str(run_dir))
     try:
         os.chmod(path, 0o600)
         with os.fdopen(fd, "w", encoding="utf-8") as f:
@@ -248,23 +275,38 @@ def format_peer_envelope(
     intent: str = "Read-Only Review",
     user_context: str | None = None,
     reply_socket: str | None = None,
-    action: str = "code_review",
+    action: str | None = None,
 ) -> str:
     """
     Format message using the standardized Peer Envelope specification.
-    Provides clear authorization boundaries, peer intent declarations,
-    and request correlation metadata to eliminate permission escalation alarms.
+    Provides structured request metadata, sender identity, operation boundaries,
+    and request correlation identifiers for peer agent collaboration.
     """
-    ctx_str = user_context.strip() if user_context else "User explicit request in active pair programming session"
     lines = [
         f"[AgentPairIPC-Req-ID: {nonce} | From: {sender}]",
         "",
         "【Agent 对等协作意图声明】",
         f"- 协作类型：{intent}",
         f"- 请求方：{sender} (Local Pair Programming Agent)",
-        "- 操作边界承诺：本轮请求仅需要只读分析与评审意见，绝不请求修改系统权限、环境变量或配置文件",
-        f"- 用户授权上下文：User explicit prompt: \"{ctx_str}\"",
     ]
+
+    # Dynamic operation boundary based on declared intent / action
+    intent_lower = intent.lower()
+    act_lower = (action or "").lower()
+    if "edit" in intent_lower or "fix" in intent_lower or "patch" in intent_lower or act_lower in ("edit", "fix", "patch"):
+        boundary = "涉及代码或工程文件修改，需遵从受邀方工程规范与安全审查"
+    elif "read-only" in intent_lower or "review" in intent_lower or "audit" in intent_lower or act_lower in ("review", "code_review", "audit"):
+        boundary = "只读分析与评审意见，不请求修改系统权限、环境变量或持久化配置"
+    else:
+        boundary = f"遵从声明意图 [{intent}]，未经受邀方评估不执行超越边界操作"
+    lines.append(f"- 操作边界声明：{boundary}")
+
+    # User authorization context: NEVER fabricate quotes
+    if user_context and user_context.strip():
+        lines.append(f"- 用户授权声明：User prompt: \"{user_context.strip()}\" (由调用方声称，未经受邀方核实)")
+    else:
+        lines.append("- 用户授权声明：未提供显式用户输入引用 (由调用方 Agent 自主触发对等协作)")
+
     if reply_socket:
         lines.append(f"- 回调通道：[ap-reply-socket: {reply_socket}]")
     lines.append("----------------------------------------------------------------")
@@ -307,9 +349,11 @@ def extract_peer_envelope(text: str) -> dict:
         intent = match_intent.group(1).strip()
 
     user_context = None
-    match_ctx = re.search(r"-\s*用户授权上下文：\s*User explicit prompt:\s*\"?([^\n\"]+)\"?", text)
+    match_ctx = re.search(r"-\s*用户授权(?:声明|上下文)：\s*(?:User\s*(?:explicit\s*)?prompt:\s*)?\"?([^\n\"]+?)\"?(?:\s*\(.*?\))?$", text, re.MULTILINE)
     if match_ctx:
-        user_context = match_ctx.group(1).strip()
+        raw_val = match_ctx.group(1).strip()
+        if not raw_val.startswith("未提供显式用户输入引用"):
+            user_context = raw_val
 
     reply_socket = None
     match_sock = re.search(r"\[ap-reply-socket:\s*([^\]\n]+)\]", text)
@@ -360,13 +404,14 @@ def extract_verdict(text: str) -> str | None:
 class EphemeralReplyServer:
     """
     Ephemeral Unix Domain Socket server for bi-directional peer responses.
-    Listens at /tmp/ap-reply-<nonce>.sock.
+    Listens at ~/.agent-pair/run/reply-<nonce>.sock with 0o600 permissions.
     Accepts responses directly from the peer agent without requiring JSONL transcript polling.
     """
 
-    def __init__(self, nonce: str, timeout: float = 300.0):
+    def __init__(self, nonce: str, timeout: float = 300.0, socket_dir: Path | None = None):
         self.nonce = nonce
-        self.socket_path = f"/tmp/ap-reply-{nonce}.sock"
+        base_dir = socket_dir or get_secure_run_dir()
+        self.socket_path = str(base_dir / f"reply-{nonce}.sock")
         self.timeout = timeout
         self.server_sock = None
         self._response_text: str | None = None
@@ -430,20 +475,23 @@ class EphemeralReplyServer:
 
             raw_str = raw_bytes.decode("utf-8", errors="replace").strip()
             # Try parsing as JSON envelope
+            content = None
             try:
                 data = json.loads(raw_str)
                 if isinstance(data, dict):
-                    content = data.get("content") or data.get("text") or data.get("message") or raw_str
-                    verdict = data.get("verdict") or extract_verdict(content)
-                    self._response_text = content
-                    self._verdict = verdict
-                    return self._response_text, self._verdict
+                    content = data.get("content") or data.get("text") or data.get("message")
             except Exception:
                 pass
 
-            # Plain text fallback
-            self._response_text = raw_str
-            self._verdict = extract_verdict(raw_str)
+            if content is None:
+                content = raw_str
+
+            # In accordance with peer review P1.1:
+            # ALWAYS derive verdict strictly from extract_verdict(content).
+            # Do NOT trust any top-level JSON "verdict" field, which could be spoofed.
+            verdict = extract_verdict(content)
+            self._response_text = content
+            self._verdict = verdict
             return self._response_text, self._verdict
 
         except Exception:
@@ -476,6 +524,13 @@ def activate_desktop_app(app_name: str, new_tab: bool = False) -> bool:
     """
     Activate a desktop application on macOS via AppleScript / System Events.
     Supports creating a new tab (Cmd+T) in supported apps (Claude Desktop, ChatGPT/Codex).
+
+    Security and Focus Safety:
+    - Verifies the target process exists and is confirmed frontmost before issuing keystrokes,
+      preventing shortcut keys from being delivered to unintended applications.
+    - Note: Generating simulated keystrokes requires macOS Accessibility permissions
+      for the calling terminal or process.
+
     Returns True if successfully executed, False otherwise.
     """
     if sys.platform != "darwin":
@@ -491,14 +546,29 @@ def activate_desktop_app(app_name: str, new_tab: bool = False) -> bool:
 
         if new_tab:
             time.sleep(0.3)
+            # Ensure process exists, set frontmost to true, and verify frontmost before keystroke
             script = f'''tell application "System Events"
-    tell process "{app_name}"
-        keystroke "t" using command down
-    end tell
+    if exists process "{app_name}" then
+        tell process "{app_name}"
+            set frontmost to true
+            repeat 5 times
+                if frontmost then exit repeat
+                delay 0.1
+            end repeat
+            if frontmost then
+                keystroke "t" using command down
+                return "ok"
+            else
+                return "not_frontmost"
+            end if
+        end tell
+    else
+        return "not_found"
+    end if
 end tell'''
             cmd_tab = ["osascript", "-e", script]
             res_tab = subprocess.run(cmd_tab, capture_output=True, text=True, timeout=5.0)
-            return res_tab.returncode == 0
+            return res_tab.returncode == 0 and "ok" in res_tab.stdout
 
         return True
     except Exception:

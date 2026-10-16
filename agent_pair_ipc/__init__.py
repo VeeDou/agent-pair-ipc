@@ -32,6 +32,7 @@ from agent_pair_ipc.common import (
     extract_verdict,
     format_peer_envelope,
     generate_nonce,
+    get_secure_run_dir,
 )
 
 __all__ = [
@@ -51,6 +52,7 @@ __all__ = [
     "format_peer_envelope",
     "extract_peer_envelope",
     "create_safe_payload_file",
+    "get_secure_run_dir",
     "EphemeralReplyServer",
     "activate_desktop_app",
     "extract_verdict",

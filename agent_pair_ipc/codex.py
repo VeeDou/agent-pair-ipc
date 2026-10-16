@@ -557,7 +557,7 @@ def send_and_wait(
     """
     Send message to Codex with correlation nonce and wait synchronously.
     Uses dual-channel listening:
-      1. Direct bi-directional Unix Domain Socket callback (/tmp/ap-reply-<nonce>.sock)
+      1. Direct bi-directional Unix Domain Socket callback (~/.agent-pair/run/reply-<nonce>.sock)
       2. Incremental TailReader on JSONL rollout transcript with fast-fail detection
     
     Returns:
@@ -759,7 +759,7 @@ def build_parser() -> argparse.ArgumentParser:
   codex-ipc --list
 
   # 2. Bind current project to specific thread:
-  codex-ipc --bind 01a13f4a-64e9-7243-a6a2-f2dc809f7b02
+  codex-ipc --bind 01234567-89ab-cdef-0123-456789abcdef
 
   # 3. Unbind project session:
   codex-ipc --unbind

@@ -552,7 +552,7 @@ def send_and_wait(
     """
     Send message to Claude Code with request correlation nonce and wait synchronously.
     Uses dual-channel listening:
-      1. Direct bi-directional Unix Domain Socket callback (/tmp/ap-reply-<nonce>.sock)
+      1. Direct bi-directional Unix Domain Socket callback (~/.agent-pair/run/reply-<nonce>.sock)
       2. Incremental TailReader on JSONL transcript
     
     Returns:
