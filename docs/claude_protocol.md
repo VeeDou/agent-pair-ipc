@@ -33,6 +33,13 @@ Claude Code running locally (CLI or Desktop app) listens on a Unix Domain Socket
    ```
 4. **Close**: Close connection after frames are flushed.
 
+The peer socket is one-way. Answers come back over the agent-pair-ipc duplex reply channel
+(`agent-pair-ipc reply --to <Req-ID>`, advertised in every Peer Envelope). See
+[duplex_reply_protocol.md](duplex_reply_protocol.md).
+
+Session metadata also exposes `status` (`idle` / `busy`) and `updatedAt`. `claude-ipc --list` shows the status,
+and the sender is told when its message will queue behind a busy turn.
+
 ## 4. Transcript Monitoring
 
 Claude Code records JSONL transcripts under:
@@ -42,3 +49,11 @@ When waiting for a response (`-w` mode):
 - **Live Tool Tracking**: Detects assistant messages where `content` contains `{"type": "tool_use", "name": "..."}`.
 - **Completion Detection**: Waits for an assistant turn where `stop_reason != "tool_use"` (typically `"end_turn"`).
 - Extracts clean final text without intermediate tool payloads.
+- The transcript is the **fallback** channel. A reply arriving on the duplex reply socket or mailbox wins.
+
+## 5. New sessions (GUI-native creation)
+
+Sessions started by a script are invisible to Claude Desktop, so `--await-new-session` never spawns `claude`.
+Instead it snapshots existing sessions, optionally (`-g`) brings Claude Desktop to front and clicks
+**File > New Session** (Cmd+N fallback), then binds the first *new* session whose `cwd` is this project
+or one of its parent directories. New sessions opened in another folder are reported, not bound.

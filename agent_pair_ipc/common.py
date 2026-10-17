@@ -1,6 +1,7 @@
 """
 Shared utilities for Agent Pair IPC.
-Provides helpers for message resolution, payload formatting, correlation nonces, and file handling.
+Provides helpers for message resolution, file-based payloads, the Peer Envelope, correlation nonces,
+the duplex reply channel (socket + mailbox), project/session path matching, and desktop GUI activation.
 """
 
 from __future__ import annotations
@@ -10,6 +11,7 @@ import os
 import re
 import sys
 import tempfile
+import time
 import uuid
 from pathlib import Path
 
@@ -150,6 +152,44 @@ def unbind_project_binding(agent_name: str, cwd: str | None = None) -> bool:
     return False
 
 
+def _read_payload_source(file_path: str) -> str | None:
+    """Read payload text from a file path, or from stdin when file_path is '-'."""
+    if file_path == "-":
+        try:
+            return sys.stdin.read().strip()
+        except Exception as e:
+            print(f"[Agent Pair IPC] Error reading stdin: {e}", file=sys.stderr)
+            return None
+    fpath = Path(file_path).expanduser().resolve()
+    if not fpath.is_file():
+        print(f"[Agent Pair IPC] Error: file not found: {file_path}", file=sys.stderr)
+        return None
+    try:
+        with open(fpath, "r", encoding="utf-8") as f:
+            return f.read().strip()
+    except Exception as e:
+        print(f"[Agent Pair IPC] Error reading file {file_path}: {e}", file=sys.stderr)
+        return None
+
+
+def warn_inline_rich_text(msg_text: str | None) -> None:
+    """
+    Nudge callers away from `-m "<rich text>"`.
+    Once a shell has evaluated backticks / $(...) inside double quotes, the lost content
+    cannot be detected here, so the only reliable fix is to stop passing rich text via argv.
+    """
+    if not msg_text:
+        return
+    if "\n" in msg_text or "`" in msg_text or "$" in msg_text or len(msg_text) > 400:
+        print(
+            "[Agent Pair IPC] Hint: rich/multi-line text passed via -m. If it was built inside a double-quoted shell string,\n"
+            "  backticks and $(...) may already have been swallowed by the shell. Prefer the file-based pipeline:\n"
+            "    agent-pair-ipc <claude|codex> -f payload.md          # from a file\n"
+            "    agent-pair-ipc <claude|codex> -f - <<'AP_EOF' ... AP_EOF   # quoted heredoc via stdin",
+            file=sys.stderr,
+        )
+
+
 def resolve_message_payload(
     message_arg: str | None = None,
     msg_flag: str | None = None,
@@ -166,25 +206,19 @@ def resolve_message_payload(
       - `tool -m "hello"` -> msg="hello", target=None
       - `tool -m "hello" sessA` -> msg="hello", target="sessA"
       - `tool -f file.md sessA` -> msg=<file>, target="sessA"
-      - `tool sessA < input` -> msg=<stdin>, target="sessA"
+      - `tool -f - sessA < input` -> msg=<stdin>, target="sessA"
+      - `tool - sessA < input` -> msg=<stdin>, target="sessA"
       - `tool -s sessA ...` -> target="sessA" (always prioritized)
     """
     target = session_flag
     msg_text = None
 
     if file_path:
-        fpath = Path(file_path).expanduser().resolve()
-        if not fpath.is_file():
-            print(f"[Agent Pair IPC] Error: file not found: {file_path}", file=sys.stderr)
-            return None, None
-        try:
-            with open(fpath, "r", encoding="utf-8") as f:
-                msg_text = f.read().strip()
-        except Exception as e:
-            print(f"[Agent Pair IPC] Error reading file {file_path}: {e}", file=sys.stderr)
+        msg_text = _read_payload_source(file_path)
+        if msg_text is None:
             return None, None
         # When -f is used, positional 'message' argument acts as target
-        if not target and message_arg:
+        if not target:
             target = message_arg or target_pos
     elif msg_flag is not None:
         msg_text = msg_flag
@@ -192,13 +226,13 @@ def resolve_message_payload(
         if not target:
             target = message_arg or target_pos
     elif message_arg == "-" or (not message_arg and not sys.stdin.isatty()):
-        try:
-            msg_text = sys.stdin.read().strip()
-        except Exception:
-            msg_text = None
-        # When stdin is piped, positional 'message' argument acts as target
-        if not target and message_arg and message_arg != "-":
-            target = message_arg or target_pos
+        msg_text = _read_payload_source("-")
+        # When stdin is piped, the remaining positional argument acts as target
+        if not target:
+            if message_arg and message_arg != "-":
+                target = message_arg
+            else:
+                target = target_pos
     else:
         # Standard positional: tool <msg> [target]
         msg_text = message_arg
@@ -214,6 +248,69 @@ def resolve_message_payload(
 def generate_nonce() -> str:
     """Generate a compact unique correlation ID for matching requests to responses."""
     return f"req_{uuid.uuid4().hex[:12]}"
+
+
+_NONCE_RE = re.compile(r"^[A-Za-z0-9_-]{4,64}$")
+
+
+def is_valid_nonce(nonce: str | None) -> bool:
+    """Correlation IDs are used to derive file names, so restrict them to a safe charset."""
+    return bool(nonce) and bool(_NONCE_RE.match(nonce))
+
+
+def detect_sender() -> str:
+    """
+    Identify the calling agent for the Peer Envelope `From:` field.
+    Order: $AGENT_PAIR_SENDER, Claude Code env markers, Codex env markers, default "Antigravity".
+    """
+    explicit = os.environ.get("AGENT_PAIR_SENDER", "").strip()
+    if explicit:
+        return explicit
+    if os.environ.get("CLAUDECODE") or os.environ.get("CLAUDE_CODE_SESSION_ID") or os.environ.get("CLAUDE_CODE_ENTRYPOINT"):
+        return "Claude Code"
+    if os.environ.get("CODEX_THREAD_ID") or os.environ.get("CODEX_SANDBOX") or os.environ.get("CODEX_SANDBOX_NETWORK_DISABLED"):
+        return "Codex"
+    return "Antigravity"
+
+
+def normalize_path(path: str | None) -> str:
+    """Resolve symlinks (e.g. macOS /tmp -> /private/tmp) so CWD comparisons are reliable."""
+    if not path:
+        return ""
+    try:
+        return os.path.realpath(os.path.expanduser(path))
+    except Exception:
+        return path
+
+
+def cwd_relation(session_cwd: str | None, cwd: str | None) -> str | None:
+    """
+    Classify how a session's CWD relates to the caller's CWD:
+      - "exact":    same directory (after symlink resolution)
+      - "ancestor": session runs at a parent directory of the caller (e.g. repo root vs. subdir)
+      - None:       unrelated
+    $HOME and / never count as ancestors, so a home-directory session can't claim every project.
+    """
+    a = normalize_path(session_cwd)
+    b = normalize_path(cwd)
+    if not a or not b:
+        return None
+    if a == b:
+        return "exact"
+    if a in (normalize_path(str(Path.home())), os.sep):
+        return None
+    if b.startswith(a.rstrip(os.sep) + os.sep):
+        return "ancestor"
+    return None
+
+
+def filter_project_sessions(candidates: list[dict], cwd: str | None = None) -> list[dict]:
+    """Return sessions whose CWD exactly matches the caller's; otherwise those at an ancestor directory."""
+    cwd = cwd or os.getcwd()
+    exact = [c for c in candidates if cwd_relation(c.get("cwd"), cwd) == "exact"]
+    if exact:
+        return exact
+    return [c for c in candidates if cwd_relation(c.get("cwd"), cwd) == "ancestor"]
 
 
 def get_secure_run_dir() -> Path:
@@ -239,6 +336,25 @@ def get_secure_run_dir() -> Path:
         except Exception:
             pass
         return tmp_run
+
+
+def get_reply_mailbox_dir() -> Path:
+    """Directory holding replies that arrived after the requester stopped listening (0o700)."""
+    box = get_secure_run_dir() / "replies"
+    box.mkdir(parents=True, exist_ok=True)
+    try:
+        os.chmod(box, 0o700)
+    except Exception:
+        pass
+    return box
+
+
+def reply_socket_path(nonce: str, socket_dir: Path | None = None) -> str:
+    return str((socket_dir or get_secure_run_dir()) / f"reply-{nonce}.sock")
+
+
+def reply_mailbox_path(nonce: str, mailbox_dir: Path | None = None) -> Path:
+    return (mailbox_dir or get_reply_mailbox_dir()) / f"{nonce}.json"
 
 
 def create_safe_payload_file(content: str, prefix: str = "ap_payload_", suffix: str = ".md") -> str:
@@ -268,6 +384,93 @@ def create_safe_payload_file(content: str, prefix: str = "ap_payload_", suffix: 
         raise
 
 
+# `codex queue --message` passes the payload through argv (macOS ARG_MAX is 1 MiB, shared with env).
+DEFAULT_SPILL_THRESHOLD_BYTES = 128 * 1024
+
+
+def spill_large_payload(message: str, threshold_bytes: int = DEFAULT_SPILL_THRESHOLD_BYTES) -> tuple[str, str | None]:
+    """
+    Keep oversized bodies out of argv: write them to a 0o600 payload file and return a short
+    pointer message instead. Returns (message_to_send, payload_path_or_None).
+    """
+    size = len(message.encode("utf-8"))
+    if size <= threshold_bytes:
+        return message, None
+    path = create_safe_payload_file(message, prefix="ap_payload_")
+    pointer = (
+        f"【文件化 Payload】本次请求正文过长（{size} 字节），已完整保存到本地文件：\n"
+        f"{path}\n"
+        "请先完整读取该文件，再按其中的要求处理。"
+    )
+    return pointer, path
+
+
+ENVELOPE_SEPARATOR = "-" * 64
+
+
+def spill_enveloped_message(message: str, threshold_bytes: int = DEFAULT_SPILL_THRESHOLD_BYTES) -> tuple[str, str | None]:
+    """
+    Like spill_large_payload, but keeps a Peer Envelope header (nonce, intent, reply instructions)
+    inline so correlation and authorization context survive; only the body is moved to a file.
+    """
+    if len(message.encode("utf-8")) <= threshold_bytes:
+        return message, None
+    sep = "\n" + ENVELOPE_SEPARATOR + "\n"
+    idx = message.find(sep)
+    if idx == -1:
+        return spill_large_payload(message, threshold_bytes=0)
+    header = message[: idx + len(sep)]
+    pointer, path = spill_large_payload(message[idx + len(sep):], threshold_bytes=0)
+    return header + pointer, path
+
+
+def cleanup_stale_run_files(max_age_seconds: float = 3 * 24 * 3600) -> int:
+    """Remove old payload files, mailbox replies, and orphaned reply sockets. Returns count removed."""
+    removed = 0
+    now = time.time()
+    try:
+        run_dir = get_secure_run_dir()
+        targets = list(run_dir.glob("ap_payload_*")) + list(run_dir.glob("reply-*.sock"))
+        box = run_dir / "replies"
+        if box.is_dir():
+            targets += list(box.glob("*.json"))
+        for p in targets:
+            try:
+                if now - p.lstat().st_mtime > max_age_seconds:
+                    p.unlink()
+                    removed += 1
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return removed
+
+
+def build_reply_command() -> str:
+    """
+    Absolute command the peer agent should run to answer a request.
+    Uses this interpreter plus the repo's bin script when available, so it works even if
+    `agent-pair-ipc` is not on the receiving agent's PATH.
+    """
+    import shlex
+    bin_script = Path(__file__).resolve().parent.parent / "bin" / "agent-pair-ipc"
+    if bin_script.is_file():
+        return f"{shlex.quote(sys.executable)} {shlex.quote(str(bin_script))}"
+    return f"{shlex.quote(sys.executable)} -m agent_pair_ipc"
+
+
+def _intent_boundary(intent: str, action: str | None = None) -> str:
+    intent_lower = intent.lower()
+    act_lower = (action or "").lower()
+    if any(k in intent_lower for k in ("notif", "fyi", "通知", "同步")) or act_lower in ("notify", "notification"):
+        return "仅为信息同步通知，不请求执行任何操作；如通知中提到上线/发布等变更，请以你的用户确认为准"
+    if "edit" in intent_lower or "fix" in intent_lower or "patch" in intent_lower or act_lower in ("edit", "fix", "patch"):
+        return "涉及代码或工程文件修改，需遵从受邀方工程规范与安全审查"
+    if "read-only" in intent_lower or "review" in intent_lower or "audit" in intent_lower or act_lower in ("review", "code_review", "audit"):
+        return "只读分析与评审意见，不请求修改系统权限、环境变量或持久化配置"
+    return f"遵从声明意图 [{intent}]，未经受邀方评估不执行超越边界操作"
+
+
 def format_peer_envelope(
     message: str,
     nonce: str,
@@ -276,11 +479,13 @@ def format_peer_envelope(
     user_context: str | None = None,
     reply_socket: str | None = None,
     action: str | None = None,
+    reply_command: str | None = None,
 ) -> str:
     """
     Format message using the standardized Peer Envelope specification.
     Provides structured request metadata, sender identity, operation boundaries,
-    and request correlation identifiers for peer agent collaboration.
+    an honest authorization statement (a peer message is never user approval),
+    and — when `reply_command` is given — instructions for answering over the duplex channel.
     """
     lines = [
         f"[AgentPairIPC-Req-ID: {nonce} | From: {sender}]",
@@ -288,28 +493,28 @@ def format_peer_envelope(
         "【Agent 对等协作意图声明】",
         f"- 协作类型：{intent}",
         f"- 请求方：{sender} (Local Pair Programming Agent)",
+        f"- 操作边界声明：{_intent_boundary(intent, action)}",
     ]
-
-    # Dynamic operation boundary based on declared intent / action
-    intent_lower = intent.lower()
-    act_lower = (action or "").lower()
-    if "edit" in intent_lower or "fix" in intent_lower or "patch" in intent_lower or act_lower in ("edit", "fix", "patch"):
-        boundary = "涉及代码或工程文件修改，需遵从受邀方工程规范与安全审查"
-    elif "read-only" in intent_lower or "review" in intent_lower or "audit" in intent_lower or act_lower in ("review", "code_review", "audit"):
-        boundary = "只读分析与评审意见，不请求修改系统权限、环境变量或持久化配置"
-    else:
-        boundary = f"遵从声明意图 [{intent}]，未经受邀方评估不执行超越边界操作"
-    lines.append(f"- 操作边界声明：{boundary}")
 
     # User authorization context: NEVER fabricate quotes
     if user_context and user_context.strip():
         lines.append(f"- 用户授权声明：User prompt: \"{user_context.strip()}\" (由调用方声称，未经受邀方核实)")
     else:
         lines.append("- 用户授权声明：未提供显式用户输入引用 (由调用方 Agent 自主触发对等协作)")
+    lines.append("- 权限说明：本消息来自对等 Agent，不构成用户批准，也不请求提升权限；超出你当前权限的操作请先向你的用户确认")
 
     if reply_socket:
         lines.append(f"- 回调通道：[ap-reply-socket: {reply_socket}]")
-    lines.append("----------------------------------------------------------------")
+    if reply_command:
+        # Command lines stay flush-left: a heredoc terminator only matches at column 0
+        lines.append("- 回复方式：完成后请把最终答复原文回传给请求方。必须用文件或带引号的 heredoc，勿用 -m 内联（避免反引号/$ 被 Shell 吞掉）：")
+        lines.append(f"{reply_command} reply --to {nonce} -f <答复文件.md>")
+        lines.append("或（heredoc 结束标记需顶格）：")
+        lines.append(f"{reply_command} reply --to {nonce} -f - <<'AP_REPLY_EOF'")
+        lines.append("<完整答复；如请求方要求 VERDICT，请保持其为最后一行>")
+        lines.append("AP_REPLY_EOF")
+        lines.append("- 回传后在本会话中照常给出答复即可；若请求方已离线，答复会自动存入其收件箱。")
+    lines.append(ENVELOPE_SEPARATOR)
     lines.append(message.strip())
     return "\n".join(lines)
 
@@ -401,18 +606,211 @@ def extract_verdict(text: str) -> str | None:
     return None
 
 
+# ---------------------------------------------------------------------------
+# Duplex reply channel (protocol 2.0)
+#
+# Requester: binds ~/.agent-pair/run/reply-<nonce>.sock and advertises `reply --to <nonce>`.
+# Replier:   connects, sends ONE JSON frame, half-closes (SHUT_WR), reads ONE JSON ack line.
+#   frame = {"x_agent_ipc_version": "2.0", "type": "reply" | "progress",
+#            "correlation_id": "<nonce>", "sender": "...", "content": "..."}
+#   ack   = {"ok": true, "correlation_id": "<nonce>"}  |  {"ok": false, "error": "..."}
+# If nobody is listening, a final reply is stored in ~/.agent-pair/run/replies/<nonce>.json
+# (the "mailbox") so the requester can pick it up later with `agent-pair-ipc inbox <nonce>`.
+# ---------------------------------------------------------------------------
+
+IPC_PROTOCOL_VERSION = "2.0"
+MAX_REPLY_BYTES = 32 * 1024 * 1024
+
+
+class ReplyRejectedError(RuntimeError):
+    """The requester's reply server refused the frame (e.g. correlation ID mismatch)."""
+    pass
+
+
+def _parse_reply_frame(raw_bytes: bytes) -> dict:
+    """Decode a reply frame; plain text (legacy v1 replies) is treated as a final reply."""
+    raw_str = raw_bytes.decode("utf-8", errors="replace").strip()
+    try:
+        data = json.loads(raw_str)
+        if isinstance(data, dict):
+            content = data.get("content")
+            if content is None:
+                content = data.get("text") or data.get("message") or ""
+            return {
+                "type": str(data.get("type") or "reply"),
+                "correlation_id": data.get("correlation_id") or data.get("x_correlation_id"),
+                "sender": data.get("sender"),
+                "content": str(content),
+            }
+    except Exception:
+        pass
+    return {"type": "reply", "correlation_id": None, "sender": None, "content": raw_str}
+
+
+def write_reply_mailbox(nonce: str, content: str, sender: str | None = None, mailbox_dir: Path | None = None) -> Path:
+    """Atomically store a final reply for a requester that is not currently listening (0o600)."""
+    if not is_valid_nonce(nonce):
+        raise ValueError(f"invalid correlation id: {nonce!r}")
+    box = mailbox_dir or get_reply_mailbox_dir()
+    target = reply_mailbox_path(nonce, box)
+    fd, tmp = tempfile.mkstemp(prefix=f".{nonce}.", suffix=".tmp", dir=str(box))
+    try:
+        os.chmod(tmp, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump({
+                "x_agent_ipc_version": IPC_PROTOCOL_VERSION,
+                "correlation_id": nonce,
+                "sender": sender,
+                "content": content,
+                "received_at": time.time(),
+            }, f, ensure_ascii=False)
+        os.replace(tmp, target)
+    except Exception:
+        if os.path.exists(tmp):
+            try:
+                os.unlink(tmp)
+            except Exception:
+                pass
+        raise
+    return target
+
+
+def read_reply_mailbox(nonce: str, consume: bool = False, mailbox_dir: Path | None = None) -> dict | None:
+    """Return a stored mailbox reply ({correlation_id, sender, content, received_at}) or None."""
+    if not is_valid_nonce(nonce):
+        return None
+    path = reply_mailbox_path(nonce, mailbox_dir)
+    if not path.is_file():
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception:
+        return None
+    if consume:
+        try:
+            path.unlink()
+        except Exception:
+            pass
+    return data if isinstance(data, dict) else None
+
+
+def list_reply_mailbox(mailbox_dir: Path | None = None) -> list[dict]:
+    """List stored mailbox replies, newest first."""
+    box = mailbox_dir or get_reply_mailbox_dir()
+    items = []
+    for p in box.glob("*.json"):
+        try:
+            with open(p, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                data.setdefault("correlation_id", p.stem)
+                items.append(data)
+        except Exception:
+            continue
+    items.sort(key=lambda d: d.get("received_at") or 0.0, reverse=True)
+    return items
+
+
+def send_reply(
+    nonce: str,
+    content: str,
+    kind: str = "reply",
+    sender: str | None = None,
+    timeout: float = 10.0,
+    socket_dir: Path | None = None,
+    mailbox_dir: Path | None = None,
+    allow_mailbox: bool = True,
+) -> str:
+    """
+    Answer a correlated request over the duplex reply socket.
+    The socket path is always derived from the nonce inside the private run dir, never taken
+    from message text, so a forged envelope cannot redirect replies to an arbitrary socket.
+
+    Returns "socket" when the requester acknowledged the frame, or "mailbox" when nobody was
+    listening and the final reply was stored for later pickup. Progress frames are best-effort
+    and return "dropped" if the requester is gone.
+    Raises ReplyRejectedError if the requester explicitly refused the frame.
+    """
+    import socket as _socket
+
+    if not is_valid_nonce(nonce):
+        raise ValueError(f"invalid correlation id: {nonce!r}")
+    sender = sender or detect_sender()
+    frame = json.dumps({
+        "x_agent_ipc_version": IPC_PROTOCOL_VERSION,
+        "type": kind,
+        "correlation_id": nonce,
+        "sender": sender,
+        "content": content,
+    }, ensure_ascii=False).encode("utf-8") + b"\n"
+
+    sock_path = reply_socket_path(nonce, socket_dir)
+    try:
+        s = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)
+        s.settimeout(timeout)
+        try:
+            s.connect(sock_path)
+            s.sendall(frame)
+            try:
+                s.shutdown(_socket.SHUT_WR)
+            except Exception:
+                pass
+            ack_raw = b""
+            while b"\n" not in ack_raw and len(ack_raw) < 65536:
+                chunk = s.recv(4096)
+                if not chunk:
+                    break
+                ack_raw += chunk
+        finally:
+            s.close()
+        ack = {}
+        try:
+            ack = json.loads(ack_raw.decode("utf-8", errors="replace").strip() or "{}")
+        except Exception:
+            ack = {}
+        if isinstance(ack, dict) and ack.get("ok") is False:
+            raise ReplyRejectedError(str(ack.get("error") or "rejected by requester"))
+        if isinstance(ack, dict) and ack.get("ok") is True:
+            return "socket"
+        # No ack (requester closed mid-read): fall through to mailbox for final replies
+    except ReplyRejectedError:
+        raise
+    except (FileNotFoundError, ConnectionRefusedError, ConnectionResetError, BrokenPipeError, _socket.timeout, OSError):
+        pass
+
+    if kind != "reply" or not allow_mailbox:
+        return "dropped"
+    write_reply_mailbox(nonce, content, sender=sender, mailbox_dir=mailbox_dir)
+    return "mailbox"
+
+
 class EphemeralReplyServer:
     """
     Ephemeral Unix Domain Socket server for bi-directional peer responses.
     Listens at ~/.agent-pair/run/reply-<nonce>.sock with 0o600 permissions.
-    Accepts responses directly from the peer agent without requiring JSONL transcript polling.
+    Accepts responses directly from the peer agent without requiring JSONL transcript polling,
+    acknowledges every frame, rejects frames carrying another request's correlation ID,
+    relays progress frames, and also checks the mailbox for replies written while unbound.
     """
 
-    def __init__(self, nonce: str, timeout: float = 300.0, socket_dir: Path | None = None):
+    def __init__(
+        self,
+        nonce: str,
+        timeout: float = 300.0,
+        socket_dir: Path | None = None,
+        mailbox_dir: Path | None = None,
+        on_progress=None,
+    ):
         self.nonce = nonce
         base_dir = socket_dir or get_secure_run_dir()
         self.socket_path = str(base_dir / f"reply-{nonce}.sock")
+        self.mailbox_dir = mailbox_dir
         self.timeout = timeout
+        self.on_progress = on_progress
+        self.progress: list[str] = []
+        self.reply_sender: str | None = None
+        self.channel: str | None = None
         self.server_sock = None
         self._response_text: str | None = None
         self._verdict: str | None = None
@@ -428,78 +826,129 @@ class EphemeralReplyServer:
                 pass
 
         sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        sock.bind(self.socket_path)
+        # Bind under a restrictive umask so the socket is never briefly world-connectable
+        old_umask = os.umask(0o177)
+        try:
+            sock.bind(self.socket_path)
+        finally:
+            os.umask(old_umask)
         try:
             os.chmod(self.socket_path, 0o600)
         except Exception:
             pass
-        sock.listen(1)
+        sock.listen(8)
         sock.setblocking(False)
         self.server_sock = sock
         return self.socket_path
 
+    def _send_ack(self, client_sock, ok: bool, error: str | None = None) -> None:
+        ack = {"ok": ok, "correlation_id": self.nonce}
+        if error:
+            ack["error"] = error
+        try:
+            client_sock.sendall((json.dumps(ack) + "\n").encode("utf-8"))
+        except Exception:
+            pass
+
+    def _finish(self, content: str, sender: str | None, channel: str) -> tuple[str, str | None]:
+        # Peer review P1.1: ALWAYS derive the verdict from the content's last line,
+        # never from any self-declared top-level JSON "verdict" field.
+        self._response_text = content
+        self._verdict = extract_verdict(content)
+        self.reply_sender = sender
+        self.channel = channel
+        return self._response_text, self._verdict
+
+    def _handle_client(self, client_sock) -> tuple[str | None, str | None]:
+        client_sock.settimeout(5.0)
+        try:
+            chunks = []
+            total = 0
+            while True:
+                data = client_sock.recv(65536)
+                if not data:
+                    break
+                chunks.append(data)
+                total += len(data)
+                if total > MAX_REPLY_BYTES:
+                    self._send_ack(client_sock, False, "reply too large")
+                    return None, None
+            raw_bytes = b"".join(chunks)
+            if not raw_bytes.strip():
+                return None, None
+
+            frame = _parse_reply_frame(raw_bytes)
+            cid = frame.get("correlation_id")
+            if cid and cid != self.nonce:
+                self._send_ack(client_sock, False, f"correlation_id mismatch (expected {self.nonce})")
+                return None, None
+
+            if frame["type"] == "progress":
+                self.progress.append(frame["content"])
+                self._send_ack(client_sock, True)
+                if self.on_progress:
+                    try:
+                        self.on_progress(frame["content"], frame.get("sender"))
+                    except Exception:
+                        pass
+                return None, None
+
+            self._send_ack(client_sock, True)
+            return self._finish(frame["content"], frame.get("sender"), "socket")
+        finally:
+            try:
+                client_sock.close()
+            except Exception:
+                pass
+
+    def check_mailbox(self) -> tuple[str | None, str | None]:
+        """Pick up a reply that was stored in the mailbox (e.g. while the socket was unavailable)."""
+        if self._response_text is not None:
+            return self._response_text, self._verdict
+        data = read_reply_mailbox(self.nonce, consume=True, mailbox_dir=self.mailbox_dir)
+        if data and data.get("content") is not None:
+            return self._finish(str(data["content"]), data.get("sender"), "mailbox")
+        return None, None
+
     def poll_response(self, timeout: float = 0.0) -> tuple[str | None, str | None]:
         """
-        Poll for an incoming response on the reply socket.
+        Poll for an incoming final response on the reply socket (and the mailbox).
+        Progress frames are consumed and relayed while waiting.
         Returns (response_text, verdict) if received, or (None, None) if not yet available.
         """
         if self._response_text is not None:
             return self._response_text, self._verdict
-        if not self.server_sock or self._is_closed:
-            return None, None
 
         import select
-        try:
-            rlist, _, _ = select.select([self.server_sock], [], [], timeout)
-            if not rlist:
-                return None, None
-
-            client_sock, _ = self.server_sock.accept()
-            client_sock.settimeout(5.0)
-            chunks = []
-            try:
-                while True:
-                    data = client_sock.recv(65536)
-                    if not data:
-                        break
-                    chunks.append(data)
-            finally:
+        deadline = time.time() + max(timeout, 0.0)
+        while True:
+            if self.server_sock and not self._is_closed:
                 try:
-                    client_sock.close()
+                    remaining = max(0.0, deadline - time.time())
+                    rlist, _, _ = select.select([self.server_sock], [], [], remaining)
+                    if rlist:
+                        client_sock, _ = self.server_sock.accept()
+                        resp, verdict = self._handle_client(client_sock)
+                        if resp is not None:
+                            return resp, verdict
+                        if time.time() < deadline:
+                            continue
                 except Exception:
                     pass
 
-            raw_bytes = b"".join(chunks)
-            if not raw_bytes:
+            resp, verdict = self.check_mailbox()
+            if resp is not None:
+                return resp, verdict
+            if time.time() >= deadline:
                 return None, None
-
-            raw_str = raw_bytes.decode("utf-8", errors="replace").strip()
-            # Try parsing as JSON envelope
-            content = None
-            try:
-                data = json.loads(raw_str)
-                if isinstance(data, dict):
-                    content = data.get("content") or data.get("text") or data.get("message")
-            except Exception:
-                pass
-
-            if content is None:
-                content = raw_str
-
-            # In accordance with peer review P1.1:
-            # ALWAYS derive verdict strictly from extract_verdict(content).
-            # Do NOT trust any top-level JSON "verdict" field, which could be spoofed.
-            verdict = extract_verdict(content)
-            self._response_text = content
-            self._verdict = verdict
-            return self._response_text, self._verdict
-
-        except Exception:
-            return None, None
+            time.sleep(min(0.1, max(0.0, deadline - time.time())))
 
     def close(self) -> None:
-        """Close server socket and remove socket file."""
+        """Close server socket, remove socket file, and drop any duplicate mailbox copy of a delivered reply."""
         self._is_closed = True
+        if self._response_text is not None:
+            # A replier that timed out waiting for our ack stores an at-least-once mailbox copy
+            read_reply_mailbox(self.nonce, consume=True, mailbox_dir=self.mailbox_dir)
         if self.server_sock:
             try:
                 self.server_sock.close()
@@ -520,16 +969,41 @@ class EphemeralReplyServer:
         self.close()
 
 
-def activate_desktop_app(app_name: str, new_tab: bool = False) -> bool:
+# ---------------------------------------------------------------------------
+# Desktop GUI lifecycle: "GUI-native creation, IPC attaches afterwards"
+# ---------------------------------------------------------------------------
+
+# Menu items verified against the macOS menu bars of Claude Desktop (File > New Session, Cmd+N)
+# and ChatGPT.app, which hosts the Codex desktop experience (File > New Chat).
+GUI_PROFILES: dict[str, dict] = {
+    "claude": {"apps": ["Claude"], "menu_items": ["New Session", "New Chat"], "key": "n"},
+    "codex": {"apps": ["ChatGPT", "Codex"], "menu_items": ["New Thread", "New Chat"], "key": "n"},
+}
+
+
+def _applescript_string(value: str) -> str:
+    return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def activate_desktop_app(
+    app_name: str,
+    new_tab: bool = False,
+    menu_items: list[str] | None = None,
+    key: str | None = None,
+) -> bool:
     """
-    Activate a desktop application on macOS via AppleScript / System Events.
-    Supports creating a new tab (Cmd+T) in supported apps (Claude Desktop, ChatGPT/Codex).
+    Activate a desktop application on macOS via AppleScript / System Events and optionally
+    ask it to create a new session.
+
+    New-session strategy:
+      1. Click the first existing item from `menu_items` in the app's File menu (robust against
+         shortcut changes across app versions).
+      2. Otherwise send Cmd+<key> ($AGENT_PAIR_GUI_NEW_SESSION_KEY overrides, default "n").
 
     Security and Focus Safety:
-    - Verifies the target process exists and is confirmed frontmost before issuing keystrokes,
-      preventing shortcut keys from being delivered to unintended applications.
-    - Note: Generating simulated keystrokes requires macOS Accessibility permissions
-      for the calling terminal or process.
+    - Verifies the target process exists and is confirmed frontmost before clicking or issuing
+      keystrokes, preventing input from being delivered to unintended applications.
+    - Requires macOS Accessibility permissions for the calling terminal or process.
 
     Returns True if successfully executed, False otherwise.
     """
@@ -537,39 +1011,83 @@ def activate_desktop_app(app_name: str, new_tab: bool = False) -> bool:
         return False
 
     import subprocess
-    import time
     try:
-        cmd_activate = ["osascript", "-e", f'tell application "{app_name}" to activate']
+        cmd_activate = ["osascript", "-e", f"tell application {_applescript_string(app_name)} to activate"]
         res = subprocess.run(cmd_activate, capture_output=True, text=True, timeout=5.0)
         if res.returncode != 0:
             return False
 
         if new_tab:
             time.sleep(0.3)
-            # Ensure process exists, set frontmost to true, and verify frontmost before keystroke
+            key = (os.environ.get("AGENT_PAIR_GUI_NEW_SESSION_KEY") or key or "n")[:1]
+            items = menu_items or []
+            items_list = "{" + ", ".join(_applescript_string(i) for i in items) + "}"
+            proc = _applescript_string(app_name)
             script = f'''tell application "System Events"
-    if exists process "{app_name}" then
-        tell process "{app_name}"
+    if exists process {proc} then
+        tell process {proc}
             set frontmost to true
-            repeat 5 times
+            repeat 10 times
                 if frontmost then exit repeat
                 delay 0.1
             end repeat
-            if frontmost then
-                keystroke "t" using command down
-                return "ok"
-            else
-                return "not_frontmost"
-            end if
+            if not frontmost then return "not_frontmost"
+            repeat with itemName in {items_list}
+                try
+                    click menu item (itemName as text) of menu 1 of menu bar item "File" of menu bar 1
+                    return "ok:menu"
+                end try
+            end repeat
+            keystroke {_applescript_string(key)} using command down
+            return "ok:key"
         end tell
     else
         return "not_found"
     end if
 end tell'''
             cmd_tab = ["osascript", "-e", script]
-            res_tab = subprocess.run(cmd_tab, capture_output=True, text=True, timeout=5.0)
+            res_tab = subprocess.run(cmd_tab, capture_output=True, text=True, timeout=8.0)
             return res_tab.returncode == 0 and "ok" in res_tab.stdout
 
         return True
     except Exception:
         return False
+
+
+def open_new_gui_session(agent: str) -> bool:
+    """Bring the agent's desktop client to front and trigger its native "new session" action."""
+    profile = GUI_PROFILES.get(agent)
+    if not profile:
+        return False
+    for app in profile["apps"]:
+        if activate_desktop_app(app, new_tab=True, menu_items=profile["menu_items"], key=profile["key"]):
+            return True
+    return False
+
+
+def settle_duplex_reply(
+    reply_server: EphemeralReplyServer | None,
+    transcript_text: str,
+    reply_cmd_seen: bool = False,
+) -> tuple[str, str | None, str]:
+    """
+    The transcript showed a final answer; give the duplex channel a moment to deliver too.
+    A reply already sitting in the socket backlog returns immediately; if the peer was seen
+    running `reply --to <nonce>`, wait a little longer for the frame to land.
+    Prefers the duplex reply (it is the peer's deliberate answer, not its chat summary).
+    Returns (text, verdict, channel) with channel in {"socket", "mailbox", "transcript"}.
+    """
+    if reply_server is not None:
+        resp, verdict = reply_server.poll_response(timeout=5.0 if reply_cmd_seen else 1.0)
+        if resp is not None:
+            return resp, verdict, reply_server.channel or "socket"
+    return transcript_text, extract_verdict(transcript_text), "transcript"
+
+
+def print_progress_frame(prefix: str):
+    """Build an on_progress callback that relays peer progress frames to stderr."""
+    def _cb(text: str, sender: str | None) -> None:
+        who = f" {sender}" if sender else ""
+        first = (text or "").strip().splitlines()[0] if (text or "").strip() else ""
+        print(f"[{prefix}] Progress from{who}: {first[:200]}", file=sys.stderr)
+    return _cb

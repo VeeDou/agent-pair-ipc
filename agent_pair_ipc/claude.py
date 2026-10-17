@@ -1,7 +1,8 @@
 """
 Claude Code IPC Communication Utility.
 Enables programmatic two-way messaging, live tool tracking, and feedback retrieval
-with active Claude Code desktop / CLI sessions via Unix Domain Sockets (UDS) and JSONL transcripts.
+with active Claude Code desktop / CLI sessions via Unix Domain Sockets (UDS), the duplex
+reply channel (reply socket + mailbox), and JSONL transcripts as fallback.
 """
 
 from __future__ import annotations
@@ -24,19 +25,25 @@ from agent_pair_ipc.common import (
     EphemeralReplyServer,
     NeedsNewSessionError,
     TailReader,
-    activate_desktop_app,
-    attach_request_header,
-    create_safe_payload_file,
+    build_reply_command,
+    cleanup_stale_run_files,
+    cwd_relation,
+    detect_sender,
     extract_nonce,
-    extract_peer_envelope,
-    extract_verdict,
+    filter_project_sessions,
     format_peer_envelope,
     generate_nonce,
     load_project_bindings,
+    open_new_gui_session,
+    print_progress_frame,
     resolve_message_payload,
     save_project_binding,
+    settle_duplex_reply,
     unbind_project_binding,
+    warn_inline_rich_text,
 )
+
+DEFAULT_AWAIT_TIMEOUT = 120.0
 
 
 def resolve_target_session(target: str | None = None, cwd: str | None = None) -> tuple[str | None, str]:
@@ -121,6 +128,7 @@ def get_active_sessions(exclude_self: bool = True, debug: bool = False) -> list[
             cwd = data.get("cwd", "")
             proc_start = data.get("procStart")
             pid_domain = data.get("pidDomain")
+            updated_at_ms = data.get("updatedAt")
 
             # Check self-exclusion
             if exclude_self:
@@ -170,7 +178,10 @@ def get_active_sessions(exclude_self: bool = True, debug: bool = False) -> list[
                 "socket_path": sock,
                 "token": token,
                 "transcript_path": transcript_path,
-                "mtime": json_file.stat().st_mtime,
+                "status": data.get("status", ""),
+                "peer_features": data.get("peerFeatures") or [],
+                # Prefer Claude's own activity timestamp over the metadata file's mtime
+                "mtime": (updated_at_ms / 1000.0) if isinstance(updated_at_ms, (int, float)) and updated_at_ms > 0 else json_file.stat().st_mtime,
             }
             candidates.append(item)
         except Exception as e:
@@ -256,9 +267,9 @@ def match_session(
     if not allow_cwd_fallback:
         return None, "none"
 
-    # Match by current working directory (CWD)
+    # Match by current project: exact CWD first, then a session running at a parent directory
     current_cwd = os.getcwd()
-    cwd_matches = [c for c in candidates if c.get("cwd") == current_cwd]
+    cwd_matches = filter_project_sessions(candidates, current_cwd)
     if not cwd_matches:
         return None, "none"
 
@@ -282,71 +293,119 @@ def match_session(
         return None, "ambiguous"
 
 
+def _session_id_set(sessions: list[dict]) -> set[str]:
+    ids = set()
+    for s in sessions:
+        if s.get("host_session_id"):
+            ids.add(s["host_session_id"])
+        if s.get("session_id"):
+            ids.add(s["session_id"])
+        if s.get("pid"):
+            ids.add(str(s["pid"]))
+    return ids
+
+
 def await_new_session(
-    timeout: float = 60.0,
+    timeout: float = DEFAULT_AWAIT_TIMEOUT,
     cwd: str | None = None,
     require_tty: bool = True,
     activate_gui: bool = False,
     debug: bool = False,
 ) -> dict | None:
     """
-    Watch for a new Claude Code session matching current CWD.
-    Snapshots pre-existing sessions to guarantee older sessions are never misidentified.
-    In non-interactive environments (non-TTY), exits immediately instead of blocking.
+    "GUI-native creation, IPC attaches afterwards":
+    watch for a new Claude Code session (Desktop tab or `claude` in a terminal) for this project.
+    - Snapshots pre-existing sessions so older sessions are never misidentified.
+    - Accepts a session at the project directory or a parent of it (symlink-resolved).
+    - Reports new sessions opened in another folder instead of silently ignoring them.
+    - In non-interactive environments (non-TTY) with require_tty, exits immediately instead of blocking.
     When detected, automatically binds hostSessionId/sessionId (never raw PID) to .agent-pair/bindings.json.
     """
     target_cwd = cwd or os.getcwd()
     if require_tty and not sys.stderr.isatty():
         print(f"[Claude Code IPC] Notice: No existing Claude Code session found for project '{target_cwd}'.", file=sys.stderr)
         print("[Claude Code IPC] Cannot interactively wait for new session in non-interactive environment (non-TTY).", file=sys.stderr)
-        print("👉 Please open project in Claude Desktop or run `claude` in terminal, or run with -s <session_id>.", file=sys.stderr)
+        print("👉 Open the project in Claude Desktop (File > New Session) or run `claude` in a terminal, then retry;", file=sys.stderr)
+        print("   or run with `--await-new-session [--await-timeout N]` to wait explicitly, or `-s <session_id>`.", file=sys.stderr)
         raise NeedsNewSessionError("Cannot await new session in non-TTY environment")
 
-    if activate_gui:
-        print("[Claude Code IPC] Activating Claude Desktop application...", file=sys.stderr)
-        if activate_desktop_app("Claude", new_tab=True):
-            print("[Claude Code IPC] Activated Claude Desktop with new tab (Cmd+T).", file=sys.stderr)
-
+    # Snapshot BEFORE asking the GUI to create a session, so the new one is never part of it
+    initial_ids = _session_id_set(get_active_sessions(exclude_self=True, debug=debug))
     watch_start = time.time()
-    print(f"[Claude Code IPC] Waiting for Claude Code session for '{target_cwd}'... (Open project in Claude Desktop or run `claude` in terminal)", file=sys.stderr)
 
-    # Snapshot initial sessions
-    initial = get_active_sessions(exclude_self=True, debug=debug)
-    initial_ids = set()
-    for s in initial:
-        if s.get("host_session_id"):
-            initial_ids.add(s["host_session_id"])
-        if s.get("session_id"):
-            initial_ids.add(s["session_id"])
-        if s.get("pid"):
-            initial_ids.add(str(s["pid"]))
+    if activate_gui:
+        print("[Claude Code IPC] Activating Claude Desktop and requesting File > New Session...", file=sys.stderr)
+        if open_new_gui_session("claude"):
+            print("[Claude Code IPC] New session requested in Claude Desktop. Pick this project's folder if prompted.", file=sys.stderr)
+        else:
+            print("[Claude Code IPC] Could not drive Claude Desktop automatically (needs macOS Accessibility permission). Please open a new session manually.", file=sys.stderr)
 
+    print(f"[Claude Code IPC] 当前工程尚未绑定活跃会话。正在等待新会话: '{target_cwd}'", file=sys.stderr)
+    print("[Claude Code IPC] 请在 Claude Desktop 中新建会话 (File > New Session / Cmd+N) 并选择本工程目录，或在终端运行 `claude`。", file=sys.stderr)
+
+    reported_foreign: set[str] = set()
+    tty = sys.stderr.isatty()
     while time.time() - watch_start < timeout:
         time.sleep(1.0)
         elapsed = int(time.time() - watch_start)
-        if sys.stderr.isatty():
-            print(f"\r[Claude Code IPC] [侦测中 {elapsed:02d}s / {int(timeout)}s] 等待 Claude Desktop 新建会话... (按 Cmd+T 或 New Chat)", end="", file=sys.stderr)
+        if tty:
+            print(f"\r[Claude Code IPC] [侦测中 {elapsed:02d}s / {int(timeout)}s] 等待新会话诞生...", end="", file=sys.stderr)
 
-        sessions = get_active_sessions(exclude_self=True, debug=debug)
-        for s in sessions:
-            if s.get("cwd") == target_cwd:
-                sid = s.get("host_session_id") or s.get("session_id")
-                pid_str = str(s.get("pid"))
-                if (sid and sid in initial_ids) or (pid_str in initial_ids):
-                    continue
-                # Only bind stable host_session_id or session_id, never raw PID
-                bind_id = s.get("host_session_id") or s.get("session_id")
-                if bind_id:
-                    save_project_binding("claude", bind_id, cwd=target_cwd)
-                    if sys.stderr.isatty():
+        for s in get_active_sessions(exclude_self=True, debug=debug):
+            sid = s.get("host_session_id") or s.get("session_id")
+            pid_str = str(s.get("pid"))
+            if (sid and sid in initial_ids) or (pid_str in initial_ids):
+                continue
+            if cwd_relation(s.get("cwd"), target_cwd) is None:
+                key = sid or pid_str
+                if key not in reported_foreign:
+                    reported_foreign.add(key)
+                    if tty:
                         print("", file=sys.stderr)
-                    print(f"[Claude Code IPC] 监听到新会话诞生: PID {s.get('pid')} [{bind_id}] -> 自动完成持久绑定！", file=sys.stderr)
-                return s
+                    print(f"[Claude Code IPC] Ignoring new session \"{s.get('name')}\" [{key}] opened in another folder: {s.get('cwd')}", file=sys.stderr)
+                    print(f"   If it is meant for this project, bind it explicitly: claude-ipc --bind {key}", file=sys.stderr)
+                continue
+            # Only bind stable host_session_id or session_id, never raw PID
+            bind_id = s.get("host_session_id") or s.get("session_id")
+            if bind_id:
+                save_project_binding("claude", bind_id, cwd=target_cwd)
+                if tty:
+                    print("", file=sys.stderr)
+                print(f"[Claude Code IPC] 监听到新会话诞生: PID {s.get('pid')} [{bind_id}] -> 自动完成持久绑定！", file=sys.stderr)
+            return s
 
-    if sys.stderr.isatty():
+    if tty:
         print("", file=sys.stderr)
     print(f"[Claude Code IPC] Timed out waiting for Claude Code session after {int(timeout)}s.", file=sys.stderr)
     return None
+
+
+def _report_missing_session(target: str | None) -> None:
+    if target:
+        print(f"[Claude Code IPC] Error: No matching session found for target '{target}'.", file=sys.stderr)
+    else:
+        print(f"[Claude Code IPC] Error: No active session matches current directory '{os.getcwd()}'.", file=sys.stderr)
+        print("Please specify a target session with `-s <session_id|name|pid>` or run `claude-ipc --list`.", file=sys.stderr)
+
+
+def _resolve_or_await_session(
+    target: str | None,
+    pick_latest: bool,
+    auto_await_new: bool,
+    activate_gui: bool,
+    await_timeout: float,
+    debug: bool,
+) -> tuple[dict | None, str]:
+    """Shared session resolution for send / send-and-wait. Raises NeedsNewSessionError in non-TTY."""
+    candidates = get_active_sessions(exclude_self=True, debug=debug)
+    session, status = match_session(target=target, candidates=candidates, pick_latest=pick_latest, debug=debug) if candidates else (None, "none")
+    if session or status == "ambiguous":
+        return session, status
+    resolved_target, _ = resolve_target_session(target)
+    if resolved_target is None and auto_await_new:
+        session = await_new_session(timeout=await_timeout, cwd=os.getcwd(), activate_gui=activate_gui, debug=debug)
+        return session, ("matched" if session else "none")
+    return None, status
 
 
 def send_message_to_claude(
@@ -357,39 +416,35 @@ def send_message_to_claude(
     pick_latest: bool = False,
     auto_await_new: bool = True,
     activate_gui: bool = False,
+    sender: str | None = None,
+    await_timeout: float = DEFAULT_AWAIT_TIMEOUT,
     debug: bool = False,
 ) -> bool:
-    """Send message to target Claude Code session via Unix Domain Socket."""
-    candidates = get_active_sessions(exclude_self=True, debug=debug)
-    session, status = match_session(target=target, candidates=candidates, pick_latest=pick_latest, debug=debug) if candidates else (None, "none")
-
+    """
+    Send message to target Claude Code session via Unix Domain Socket.
+    Messages not yet enveloped are wrapped in a Peer Envelope that tells the peer how to answer
+    with `agent-pair-ipc reply --to <nonce>`; a reply sent while nobody waits lands in the mailbox.
+    """
+    session, status = _resolve_or_await_session(target, pick_latest, auto_await_new, activate_gui, await_timeout, debug)
     if not session:
-        if status == "ambiguous":
-            return False
-        resolved_target, _ = resolve_target_session(target)
-        if resolved_target is None and auto_await_new:
-            session = await_new_session(timeout=60.0, cwd=os.getcwd(), activate_gui=activate_gui, debug=debug)
-
-    if not session:
-        if target:
-            print(f"[Claude Code IPC] Error: No matching session found for target '{target}'.", file=sys.stderr)
-        else:
-            print(f"[Claude Code IPC] Error: No active session matches current directory '{os.getcwd()}'.", file=sys.stderr)
-            print("Please specify a target session with `-s <session_id|name|pid>` or run `claude-ipc --list`.", file=sys.stderr)
+        if status != "ambiguous":
+            _report_missing_session(target)
         return False
 
     sock_path = session["socket_path"]
     token = session["token"]
 
     # Wrap in Peer Envelope if not already wrapped
-    if not extract_nonce(message):
+    nonce = extract_nonce(message)
+    if not nonce:
         nonce = generate_nonce()
         message = format_peer_envelope(
             message=message,
             nonce=nonce,
-            sender="Antigravity",
+            sender=sender or detect_sender(),
             intent=intent,
             user_context=user_context,
+            reply_command=build_reply_command(),
         )
 
     try:
@@ -413,7 +468,9 @@ def send_message_to_claude(
 
         display_name = session["name"] or session["session_id"]
         sess_id = session["host_session_id"] or session["session_id"]
-        print(f"[Claude Code IPC] Message successfully delivered to session PID {session['pid']} ({display_name}) [ID: {sess_id}].")
+        print(f"[Claude Code IPC] Message successfully delivered to session PID {session['pid']} ({display_name}) [ID: {sess_id}] (Req-ID: {nonce}).")
+        if session.get("status") == "busy":
+            print("[Claude Code IPC] Note: Target session is busy; the message will be processed after its current turn.", file=sys.stderr)
         if session.get("entrypoint") == "claude-desktop":
             print("[Claude Code IPC] Tip: Target is Claude Desktop. If the window is inactive, switch to it to wake message processing.", file=sys.stderr)
         return True
@@ -433,6 +490,8 @@ def send_file(
     pick_latest: bool = False,
     auto_await_new: bool = True,
     activate_gui: bool = False,
+    sender: str | None = None,
+    await_timeout: float = DEFAULT_AWAIT_TIMEOUT,
     debug: bool = False,
 ) -> bool | tuple[str | None, str | None]:
     """
@@ -454,28 +513,20 @@ def send_file(
     if prefix:
         content = f"{prefix.strip()}\n\n{content}"
 
-    if wait:
-        return send_and_wait(
-            content,
-            target=target,
-            timeout=timeout,
-            intent=intent,
-            user_context=user_context,
-            pick_latest=pick_latest,
-            auto_await_new=auto_await_new,
-            activate_gui=activate_gui,
-            debug=debug,
-        )
-    return send_message_to_claude(
-        content,
+    common_kwargs = dict(
         target=target,
         intent=intent,
         user_context=user_context,
         pick_latest=pick_latest,
         auto_await_new=auto_await_new,
         activate_gui=activate_gui,
+        sender=sender,
+        await_timeout=await_timeout,
         debug=debug,
     )
+    if wait:
+        return send_and_wait(content, timeout=timeout, **common_kwargs)
+    return send_message_to_claude(content, **common_kwargs)
 
 
 def read_transcript_messages(transcript_path: str | None, last_n: int = 1, only_final: bool = True) -> list[dict]:
@@ -541,43 +592,38 @@ def send_and_wait(
     target: str | None = None,
     timeout: float = 300.0,
     show_progress: bool = True,
-    sender_name: str = "Antigravity",
+    sender_name: str | None = None,
     intent: str = "Read-Only Review",
     user_context: str | None = None,
     pick_latest: bool = False,
     auto_await_new: bool = True,
     activate_gui: bool = False,
+    sender: str | None = None,
+    await_timeout: float = DEFAULT_AWAIT_TIMEOUT,
     debug: bool = False,
 ) -> tuple[str | None, str | None]:
     """
     Send message to Claude Code with request correlation nonce and wait synchronously.
     Uses dual-channel listening:
-      1. Direct bi-directional Unix Domain Socket callback (~/.agent-pair/run/reply-<nonce>.sock)
-      2. Incremental TailReader on JSONL transcript
-    
+      1. Duplex reply channel: ephemeral socket ~/.agent-pair/run/reply-<nonce>.sock (+ mailbox),
+         which the peer answers via `agent-pair-ipc reply --to <nonce>` (advertised in the envelope)
+      2. Fallback: incremental TailReader on the JSONL transcript
+
     Returns:
         tuple[response_text, verdict]
     """
-    candidates = get_active_sessions(exclude_self=True, debug=debug)
-    session, status = match_session(target=target, candidates=candidates, pick_latest=pick_latest, debug=debug) if candidates else (None, "none")
+    sender = sender or sender_name or detect_sender()
+    try:
+        session, status = _resolve_or_await_session(target, pick_latest, auto_await_new, activate_gui, await_timeout, debug)
+    except NeedsNewSessionError:
+        return None, "NEEDS_NEW_THREAD"
 
     if not session:
-        if status == "ambiguous":
-            return None, None
-        resolved_target, _ = resolve_target_session(target)
-        if resolved_target is None and auto_await_new:
-            try:
-                session = await_new_session(timeout=60.0, cwd=os.getcwd(), activate_gui=activate_gui, debug=debug)
-            except NeedsNewSessionError:
-                return None, "NEEDS_NEW_THREAD"
-
-    if not session:
-        if target:
-            print(f"[Claude Code IPC] Error: No matching session found for target '{target}'.", file=sys.stderr)
-        else:
-            print(f"[Claude Code IPC] Error: No active session matches current directory '{os.getcwd()}'.", file=sys.stderr)
-            print("Please specify a target with `-s <session>` or run `claude-ipc --list`.", file=sys.stderr)
+        if status != "ambiguous":
+            _report_missing_session(target)
         return None, None
+
+    cleanup_stale_run_files()
 
     transcript_path = session.get("transcript_path")
     initial_offset = 0
@@ -586,21 +632,26 @@ def send_and_wait(
 
     # Attach unique correlation nonce and start ephemeral reply server
     nonce = generate_nonce()
-    reply_server = EphemeralReplyServer(nonce=nonce, timeout=timeout)
+    reply_server = EphemeralReplyServer(
+        nonce=nonce,
+        timeout=timeout,
+        on_progress=print_progress_frame("Claude Code IPC") if show_progress else None,
+    )
     reply_sock_path = None
     try:
         reply_sock_path = reply_server.start()
     except Exception as e:
         if debug:
-            print(f"[Claude Code IPC Debug] Could not start ephemeral reply server: {e}", file=sys.stderr)
+            print(f"[Claude Code IPC Debug] Could not start ephemeral reply server (mailbox still active): {e}", file=sys.stderr)
 
     full_message = format_peer_envelope(
         message=message,
         nonce=nonce,
-        sender=sender_name,
+        sender=sender,
         intent=intent,
         user_context=user_context,
         reply_socket=reply_sock_path,
+        reply_command=build_reply_command(),
     )
 
     try:
@@ -620,21 +671,21 @@ def send_and_wait(
         start_time = time.time()
         seen_tool_ids = set()
         found_request = False
+        reply_cmd_seen = False
         warned_idle = False
         warned_delivery = False
         tail_reader = TailReader(transcript_path, start_offset=initial_offset)
+        reply_marker = f"reply --to {nonce}"
 
         while time.time() - start_time < timeout:
-            time.sleep(0.5)
+            # Channel 1: duplex reply socket / mailbox (also serves as the loop's sleep)
+            r_resp, r_verdict = reply_server.poll_response(timeout=0.5)
+            if r_resp is not None:
+                if debug:
+                    print(f"[Claude Code IPC Debug] Response received via duplex channel ({reply_server.channel}).", file=sys.stderr)
+                return r_resp, r_verdict
 
-            # Dual-Channel 1: Check ephemeral reply socket first (direct bidirectional callback)
-            if reply_server:
-                r_resp, r_verdict = reply_server.poll_response(timeout=0.0)
-                if r_resp is not None:
-                    if debug:
-                        print(f"[Claude Code IPC Debug] Response received via ephemeral reply socket: {reply_sock_path}", file=sys.stderr)
-                    return r_resp, r_verdict
-
+            # Channel 2: transcript fallback
             if not transcript_path or not os.path.exists(transcript_path):
                 transcript_path = find_transcript_path(session.get("cwd", ""), session.get("session_id", ""))
                 if not transcript_path or not os.path.exists(transcript_path):
@@ -676,15 +727,15 @@ def send_and_wait(
 
                     # Step 2: Once correlated request is identified, track assistant tools and final completion
                     elif found_request and role == "assistant":
-                        # Live tool tracking
-                        if show_progress:
-                            for c in msg.get("content", []):
-                                if isinstance(c, dict) and c.get("type") == "tool_use":
-                                    tid = c.get("id")
-                                    tname = c.get("name")
-                                    if tid and tid not in seen_tool_ids:
-                                        seen_tool_ids.add(tid)
-                                        print(f"[Claude Code IPC] Running tool: {tname}...", file=sys.stderr)
+                        for c in msg.get("content", []):
+                            if isinstance(c, dict) and c.get("type") == "tool_use":
+                                if reply_marker in json.dumps(c.get("input", {}), ensure_ascii=False):
+                                    reply_cmd_seen = True
+                                tid = c.get("id")
+                                tname = c.get("name")
+                                if show_progress and tid and tid not in seen_tool_ids:
+                                    seen_tool_ids.add(tid)
+                                    print(f"[Claude Code IPC] Running tool: {tname}...", file=sys.stderr)
 
                         # Completion check
                         stop_reason = msg.get("stop_reason")
@@ -695,8 +746,10 @@ def send_and_wait(
                                     texts.append(part.get("text", ""))
                             full_text = "\n".join(texts).strip()
                             if full_text:
-                                verdict = extract_verdict(full_text)
-                                return full_text, verdict
+                                text, verdict, channel = settle_duplex_reply(reply_server, full_text, reply_cmd_seen)
+                                if debug:
+                                    print(f"[Claude Code IPC Debug] Final answer taken from {channel}.", file=sys.stderr)
+                                return text, verdict
 
                 except Exception as parse_err:
                     if debug:
@@ -704,10 +757,10 @@ def send_and_wait(
                     continue
 
         print(f"[Claude Code IPC] Timed out waiting for response after {int(timeout)}s (Req-ID: {nonce}).", file=sys.stderr)
+        print(f"[Claude Code IPC] A late reply will be kept in the mailbox: agent-pair-ipc inbox {nonce}", file=sys.stderr)
         return None, None
     finally:
-        if reply_server:
-            reply_server.close()
+        reply_server.close()
 
 
 def list_sessions(candidates: list[dict] | None = None, debug: bool = False):
@@ -723,14 +776,16 @@ def list_sessions(candidates: list[dict] | None = None, debug: bool = False):
     self_ids = get_self_session_identifiers()
 
     print(f"Found {len(candidates)} active Claude Code session(s):\n")
-    print(f"{'PID':<7} {'KIND':<18} {'HOST_SESSION_ID':<40} {'NAME / TITLE'}")
-    print("-" * 95)
+    print(f"{'PID':<7} {'KIND':<30} {'STATUS':<7} {'HOST_SESSION_ID':<40} {'NAME / TITLE'}")
+    print("-" * 115)
     for c in candidates:
         hid = c["host_session_id"] or c["session_id"]
         kind_entry = f"{c['kind']} ({c['entrypoint']})" if c['entrypoint'] else c['kind']
         is_self = " (Current Session)" if str(c["pid"]) == str(self_ids["pid"]) else ""
-        is_cwd = " [Current Project]" if c.get("cwd") == current_cwd else ""
-        print(f"{c['pid']:<7} {kind_entry:<18} {hid:<40} {c['name']}{is_self}{is_cwd}")
+        relation = cwd_relation(c.get("cwd"), current_cwd)
+        is_cwd = " [Current Project]" if relation == "exact" else (" [Parent of CWD]" if relation == "ancestor" else "")
+        status = c.get("status") or "-"
+        print(f"{c['pid']:<7} {kind_entry:<30} {status:<7} {hid:<40} {c['name']}{is_self}{is_cwd}")
         print(f"        └─ Socket:     {c['socket_path']}")
         print(f"        └─ CWD:        {c['cwd']}")
         print(f"        └─ Transcript: {c['transcript_path'] or '(not found)'}\n")
@@ -745,11 +800,16 @@ def build_parser() -> argparse.ArgumentParser:
   # 1. List active sessions:
   claude-ipc --list
 
-  # 3. Unbind project session:
+  # 2. Unbind project session:
   claude-ipc --unbind
 
-  # 4. Deliver file content and wait for response (Auto-detects current project session!):
+  # 3. Deliver file content and wait for response (Auto-detects current project session!):
   claude-ipc -w -f docs/reports/REVIEW_REQUEST.md
+
+  # 4. Rich text without shell escaping: quoted heredoc piped through stdin
+  claude-ipc -w -f - <<'AP_EOF'
+  Review `proxy.yaml` rule AND,((DOMAIN-SUFFIX,example.com)) and $VARS verbatim.
+  AP_EOF
 
   # 5. Deliver report picking latest if multiple sessions exist:
   claude-ipc -w --pick-latest -f docs/reports/REVIEW_REQUEST.md
@@ -760,26 +820,34 @@ def build_parser() -> argparse.ArgumentParser:
   # 7. Read latest assistant response:
   claude-ipc -r
   claude-ipc -r -n 3
+
+  # 8. No session yet: open one in Claude Desktop (File > New Session) and auto-bind it
+  claude-ipc --await-new-session -g -w -f docs/reports/REVIEW_REQUEST.md
+
+  # 9. The peer answers over the duplex channel (command is printed in the envelope):
+  agent-pair-ipc reply --to req_0123456789ab -f answer.md
 """
     )
     parser.add_argument("message", nargs="?", default=None, help="Message text or target session if -m/-f/stdin is provided")
     parser.add_argument("target_pos", nargs="?", default=None, help="Target session ID, title, or PID (positional alternative to -s/--session)")
     parser.add_argument("-m", "--msg", dest="msg_flag", default=None, help="Explicit message text to send")
-    parser.add_argument("-f", "--file", dest="file_path", default=None, help="Path to file whose content should be sent as message")
+    parser.add_argument("-f", "--file", dest="file_path", default=None, help="Path to file whose content should be sent as message ('-' reads stdin; recommended for rich text)")
     parser.add_argument("--prefix", dest="prefix", default=None, help="Optional text prefix to prepend before file/stdin content")
     parser.add_argument("-s", "--session", dest="session_target", default=None, help="Target session ID, hostSessionId, title/name, or PID")
     parser.add_argument("--bind", dest="bind_target", default=None, help="Bind target session ID to current project in .agent-pair/bindings.json")
     parser.add_argument("--unbind", action="store_true", help="Remove the project session binding in .agent-pair/bindings.json")
     parser.add_argument("--pick-latest", action="store_true", help="Pick the latest session if multiple match current project CWD")
-    parser.add_argument("--await-new-session", action="store_true", help="Wait for a new Claude Code session for this project, auto-bind and send")
+    parser.add_argument("--await-new-session", "--await-new-thread", dest="await_new_session", action="store_true", help="Wait for a new Claude Code session for this project, auto-bind and send (works in non-TTY)")
+    parser.add_argument("--await-timeout", type=float, default=DEFAULT_AWAIT_TIMEOUT, help=f"Seconds to wait for a new session (default: {int(DEFAULT_AWAIT_TIMEOUT)})")
     parser.add_argument("--no-auto-new", action="store_true", help="Disable automatic wait-for-new-session when no session exists for project")
     parser.add_argument("-l", "--list", action="store_true", help="List all currently active and connectable Claude Code sessions")
     parser.add_argument("-r", "--read", action="store_true", help="Read the latest assistant feedback/response from the target session")
     parser.add_argument("-a", "--all-turns", action="store_true", help="Include intermediate tool-use turns when reading transcript (default: final turns only)")
     parser.add_argument("-n", "--number", type=int, default=1, help="Number of assistant turns to read (default: 1)")
-    parser.add_argument("-g", "--activate-gui", action="store_true", help="Activate Claude Desktop application (and open new tab if creating new session)")
+    parser.add_argument("-g", "--activate-gui", action="store_true", help="Activate Claude Desktop and trigger File > New Session when waiting for a new session")
     parser.add_argument("--intent", default="Read-Only Review", help="Peer cooperation intent declaration (default: 'Read-Only Review')")
     parser.add_argument("--user-context", default=None, help="User prompt authorization context to pass in peer envelope")
+    parser.add_argument("--sender", default=None, help="Sender name in the peer envelope (default: $AGENT_PAIR_SENDER or auto-detected)")
     parser.add_argument("-w", "--wait", action="store_true", help="Send message and synchronously wait for Claude Code's response")
     parser.add_argument("-t", "--timeout", type=float, default=300.0, help="Wait timeout in seconds (default: 300)")
     parser.add_argument("--debug", action="store_true", help="Enable verbose debug logs")
@@ -821,7 +889,7 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.await_new_session:
         try:
-            new_sess = await_new_session(timeout=60.0, require_tty=False, activate_gui=args.activate_gui, debug=args.debug)
+            new_sess = await_new_session(timeout=args.await_timeout, require_tty=False, activate_gui=args.activate_gui, debug=args.debug)
             if not new_sess:
                 return EXIT_ERROR
             target = new_sess.get("host_session_id") or new_sess.get("session_id") or str(new_sess["pid"])
@@ -842,6 +910,8 @@ def main(argv: list[str] | None = None) -> int:
         return EXIT_ERROR
 
     target = resolved_target
+    if args.msg_flag is not None:
+        warn_inline_rich_text(msg_text)
 
     if args.wait:
         resp, verdict = send_and_wait(
@@ -853,6 +923,8 @@ def main(argv: list[str] | None = None) -> int:
             pick_latest=args.pick_latest,
             auto_await_new=not args.no_auto_new,
             activate_gui=args.activate_gui,
+            sender=args.sender,
+            await_timeout=args.await_timeout,
             debug=args.debug,
         )
         if verdict == "NEEDS_NEW_THREAD":
@@ -878,6 +950,8 @@ def main(argv: list[str] | None = None) -> int:
             pick_latest=args.pick_latest,
             auto_await_new=not args.no_auto_new,
             activate_gui=args.activate_gui,
+            sender=args.sender,
+            await_timeout=args.await_timeout,
             debug=args.debug,
         )
         return EXIT_SIGN_OFF if ok else EXIT_ERROR

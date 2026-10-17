@@ -25,8 +25,17 @@ Because these agents operate with shell execution (`bash`), file read/write, and
    - This prevents unprivileged local OS users from eavesdropping or injecting replies.
    - *Note*: Other processes running under the same OS user share identical POSIX permissions and could technically write to the socket or transcript file. This is consistent with local IPC threat models.
 
-5. **macOS GUI Automation & Accessibility (Experimental)**:
-   - `activate_desktop_app(..., new_tab=True)` attempts to trigger `Cmd+T` via AppleScript / System Events to open new session tabs in desktop applications.
+5. **Duplex Reply Channel & Mailbox**:
+   - `agent-pair-ipc reply --to <Req-ID>` derives the socket path from the request ID inside `~/.agent-pair/run/`. It never connects to a path taken from message text, so forged envelopes cannot redirect replies.
+   - Request IDs are restricted to `[A-Za-z0-9_-]{4,64}` (no path traversal). Frames with a mismatched correlation ID are rejected with a negative ack, and frames larger than 32 MiB are refused.
+   - Offline replies are written atomically to `~/.agent-pair/run/replies/<Req-ID>.json` (0600) and removed once read. Verdicts are always re-derived from the reply text.
+   - Sandboxed receivers (e.g. Codex `workspace-write`) may need user approval to reach `~/.agent-pair/run`. If they are denied, the requester falls back to the transcript channel.
+
+6. **Peer Envelope & Authorization Honesty**:
+   - Every envelope states that a peer message is **not** user approval and does not request privilege escalation. `--user-context` only quotes what the user actually said and is labelled as unverified by the receiver. Never fabricate it.
+
+7. **macOS GUI Automation & Accessibility (Experimental)**:
+   - `open_new_gui_session()` brings the desktop app to front and clicks its native "new session" menu item (Claude: File > New Session; ChatGPT/Codex: File > New Chat), falling back to Cmd+N.
    - This feature requires explicit macOS Accessibility permissions for the calling process.
    - It is marked as **experimental** across varying client desktop UI states, though focus-verification loops are enforced before issuing keystrokes to prevent delivery to unintended windows.
 

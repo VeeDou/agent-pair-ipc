@@ -66,7 +66,10 @@ flowchart TD
   - **Claude Code**：通过 Unix Domain Socket（UDS）进行双向鉴权通信，实时解析会话 JSONL 转储。
   - **OpenAI Codex**：利用原生 `codex queue` 管道投递消息，精准监控 Rollout 事件流中的 `Reasoning`、工具调用与 `task_complete`。
 - 🎯 **安全零配置识别**：自动按当前项目目录（CWD）智能匹配对应的活跃会话，内置自身会话排除机制，杜绝“发给自己”与跨项目盲猜。
-- 📁 **文件直发协议（`-f`）**：彻底解决复杂 Markdown 报告与数千行代码 Diff 在命令行传参时的 Shell 转义与长度截断问题。
+- 📁 **文件化 Payload 管道（`-f` / `-f -`）**：文件或带引号 heredoc 经 stdin 传递，反引号与 `$(...)` 原样保留；Codex 超长正文自动落盘为 0600 文件，不再塞进 argv。
+- ↩️ **双向回调通道**：每个请求都带回信地址，对方用 `agent-pair-ipc reply --to <Req-ID>` 经临时 0600 Socket 直接回传（支持进度帧与 ACK）；请求方离线时进入收件箱（`agent-pair-ipc inbox`），转录追踪保留为兜底。详见 [docs/duplex_reply_protocol.md](docs/duplex_reply_protocol.md)。
+- 🖥️ **GUI 原生拉起，IPC 随后挂载**：无会话时 `--await-new-session -g` 通过桌面端自带的 New Session 新建**可见**会话并自动绑定，不再生成隐形孤儿进程。
+- 🛡️ **如实的对等信封**：声明意图、操作边界、未经核实的用户原话引用，并明确“对等消息不构成用户批准”，与 Claude Code 的 Peer 策略一致而非触发警报。
 - ⚡ **O(1) 增量转储追踪**：基于文件 offset 增量 seek 读取，彻底消除大体积（数十至数百兆）历史会话轮询时的 IO 瓶颈。
 - 🔗 **请求-响应关联（Nonce）**：每次交付请求注入唯一凭证（Req-ID），确保精准捕获后续的对应答复，杜绝误判并发老任务。
 - 🚦 **机器可读的裁决契约**：内置 `VERDICT: SIGN_OFF` 与 `VERDICT: CHANGES_REQUESTED` 自动化语义解析，直接映射终端退出码。
@@ -105,6 +108,16 @@ claude-ipc -w -f ./templates/REVIEW_REQUEST.md
 codex-ipc -w -f ./templates/REVIEW_REQUEST.md
 ```
 
+### 方式 3：全工作区统一接入同一引擎
+
+```bash
+make link-skills
+```
+
+把 `~/.agents/skills/{claude-code-ipc,codex-ipc}` 与 `~/.gemini/config/skills/...` 软链接到本仓库，
+任何项目目录调用的都是同一套 IPC 引擎；Skill 内 `scripts/*.py` 旧路径保留为薄 shim 继续可用。
+若目标位置是旧版实体目录，会先备份到 `~/.agent-pair/backups/`。
+
 ---
 
 ## 📖 常用命令速查
@@ -121,8 +134,16 @@ claude-ipc -w --prefix "【第六期完成】请独立跑测复核" -f docs/repo
 # 只读模式：直接拉取最新一条结论（不发送新消息）
 claude-ipc -r
 
+# 富文本 / 代码：带引号 heredoc 经 stdin 发送，免 Shell 转义
+claude-ipc -w -f - <<'AP_EOF'
+请检查 `rules/proxy.yaml`：AND,((DST-PORT,443),(NETWORK,UDP)),REJECT
+AP_EOF
+
+# 尚无会话：唤醒 Claude Desktop 新建会话（File > New Session），自动绑定并投递
+claude-ipc --await-new-session -g -w -f docs/reports/REVIEW_REQUEST.md
+
 # 异步通知模式（Fire-and-forget）
-claude-ipc -m "后台测试构建已完成"
+claude-ipc --intent Notification -m "后台测试构建已完成"
 
 # 列出所有可连接的 Claude 会话
 claude-ipc -l
@@ -144,6 +165,20 @@ codex-ipc -r -s 01234567-89ab-cdef-0123-456789abcdef
 codex-ipc -l
 ```
 
+### 3. 双向回调（`agent-pair-ipc reply` / `inbox`）
+
+```bash
+# 接收方：回传答复（完整命令已印在信封中）
+agent-pair-ipc reply --to req_8f3e2a0c1b2d -f - <<'AP_REPLY_EOF'
+`rules.yaml` 中发现 1 处问题……
+VERDICT: CHANGES_REQUESTED
+AP_REPLY_EOF
+
+# 请求方：取回等待结束后才到达的答复
+agent-pair-ipc inbox
+agent-pair-ipc inbox req_8f3e2a0c1b2d
+```
+
 ---
 
 ## 🐍 Python API 编程式调用
@@ -154,12 +189,21 @@ codex-ipc -l
 from agent_pair_ipc import send_and_wait_claude, send_and_wait_codex
 
 # 发送交付请求并等待 Claude Code 返回结果（超时 180 秒）
-verdict = send_and_wait_claude(
-    message="所有单元测试跑通，请复核架构是否符合设计规范。",
-    timeout=180.0
+response, verdict = send_and_wait_claude(
+    message="所有单元测试跑通，请复核 `api/v2` 是否符合设计规范。",
+    timeout=180.0,
+    user_context="把这个拿给Claude code审核",  # 如实引用用户原话，不得编造
 )
 
-print("Claude Code 评审结论：", verdict)
+print("Claude Code 评审结论：", verdict)  # "SIGN_OFF" / "CHANGES_REQUESTED" / None
+```
+
+接收方以编程方式回传答复：
+
+```python
+from agent_pair_ipc import send_reply
+
+channel = send_reply("req_8f3e2a0c1b2d", "复核通过。\n\nVERDICT: SIGN_OFF")  # "socket" 或 "mailbox"
 ```
 
 ---

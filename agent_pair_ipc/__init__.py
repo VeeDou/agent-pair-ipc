@@ -4,7 +4,7 @@ agent-pair-ipc: Zero-dependency Local IPC & Pair-Review Toolkit for AI Coding Ag
 
 from __future__ import annotations
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 
 from agent_pair_ipc.claude import (
     get_active_sessions as get_active_claude_sessions,
@@ -24,15 +24,23 @@ from agent_pair_ipc.codex import (
 )
 from agent_pair_ipc.common import (
     EphemeralReplyServer,
+    ReplyRejectedError,
     activate_desktop_app,
     attach_request_header,
+    build_reply_command,
     create_safe_payload_file,
+    detect_sender,
     extract_nonce,
     extract_peer_envelope,
     extract_verdict,
     format_peer_envelope,
     generate_nonce,
     get_secure_run_dir,
+    list_reply_mailbox,
+    open_new_gui_session,
+    read_reply_mailbox,
+    send_reply,
+    spill_large_payload,
 )
 
 __all__ = [
@@ -59,4 +67,12 @@ __all__ = [
     "extract_nonce",
     "generate_nonce",
     "attach_request_header",
+    "send_reply",
+    "read_reply_mailbox",
+    "list_reply_mailbox",
+    "ReplyRejectedError",
+    "build_reply_command",
+    "detect_sender",
+    "open_new_gui_session",
+    "spill_large_payload",
 ]

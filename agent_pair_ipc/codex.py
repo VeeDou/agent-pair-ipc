@@ -1,7 +1,8 @@
 """
 Codex IPC Communication Utility.
 Enables programmatic two-way messaging, real-time activity tracking, and review result retrieval
-with active Codex desktop sessions via session transcript monitoring and `codex queue`.
+with active Codex desktop sessions via `codex queue`, the duplex reply channel
+(reply socket + mailbox), and session transcript monitoring as fallback.
 """
 
 from __future__ import annotations
@@ -25,19 +26,26 @@ from agent_pair_ipc.common import (
     EphemeralReplyServer,
     NeedsNewSessionError,
     TailReader,
-    activate_desktop_app,
-    attach_request_header,
-    create_safe_payload_file,
+    build_reply_command,
+    cleanup_stale_run_files,
+    cwd_relation,
+    detect_sender,
     extract_nonce,
-    extract_peer_envelope,
-    extract_verdict,
+    filter_project_sessions,
     format_peer_envelope,
     generate_nonce,
     load_project_bindings,
+    open_new_gui_session,
+    print_progress_frame,
     resolve_message_payload,
     save_project_binding,
+    settle_duplex_reply,
+    spill_enveloped_message,
     unbind_project_binding,
+    warn_inline_rich_text,
 )
+
+DEFAULT_AWAIT_TIMEOUT = 120.0
 
 
 def get_session_meta_from_file(rollout_path: Path | str) -> dict:
@@ -220,16 +228,16 @@ def match_session(
     if not allow_cwd_fallback:
         return None, "none"
 
-    # Auto-match by current working directory (CWD)
+    # Auto-match by current project: exact CWD first, then a session running at a parent directory
     current_cwd = os.getcwd()
-    cwd_matches = []
+    interactive = []
     for c in candidates:
         enrich_session_info(c)
         # Rule 1: Exclude CLI offline sessions
         if c.get("source") == "exec":
             continue
-        if c.get("cwd") == current_cwd:
-            cwd_matches.append(c)
+        interactive.append(c)
+    cwd_matches = filter_project_sessions(interactive, current_cwd)
 
     if not cwd_matches:
         return None, "none"
@@ -261,7 +269,7 @@ def match_session(
 
 
 def await_new_thread(
-    timeout: float = 60.0,
+    timeout: float = DEFAULT_AWAIT_TIMEOUT,
     cwd: str | None = None,
     require_tty: bool = True,
     activate_gui: bool = False,
@@ -277,17 +285,12 @@ def await_new_thread(
     if require_tty and not sys.stderr.isatty():
         print(f"[Codex IPC] Notice: No existing Codex session found for project '{target_cwd}'.", file=sys.stderr)
         print("[Codex IPC] Cannot interactively wait for new thread in non-interactive environment (non-TTY).", file=sys.stderr)
-        print("👉 Please create a new thread in Codex Desktop, or run with -s <session_id>.", file=sys.stderr)
+        print("👉 Create a new thread for this project in the Codex desktop app, then retry;", file=sys.stderr)
+        print("   or run with `--await-new-thread [--await-timeout N]` to wait explicitly, or `-s <session_id>`.", file=sys.stderr)
         raise NeedsNewSessionError("Cannot await new thread in non-TTY environment")
-
-    if activate_gui:
-        print("[Codex IPC] Activating Codex Desktop application...", file=sys.stderr)
-        if not activate_desktop_app("ChatGPT", new_tab=True):
-            activate_desktop_app("Codex", new_tab=True)
 
     watch_start = time.time()
     sessions_root = Path.home() / ".codex" / "sessions"
-    print(f"[Codex IPC] Waiting for new thread in Codex Desktop for '{target_cwd}'... (Click 'New Thread' in Desktop app)", file=sys.stderr)
 
     today_dt = datetime.date.today()
     yesterday_dt = today_dt - datetime.timedelta(days=1)
@@ -307,11 +310,24 @@ def await_new_thread(
                 if sid:
                     initial_session_ids.add(sid)
 
+    # Snapshot is taken BEFORE asking the GUI to create a thread
+    if activate_gui:
+        print("[Codex IPC] Activating the Codex desktop app and requesting a new thread...", file=sys.stderr)
+        if open_new_gui_session("codex"):
+            print("[Codex IPC] New thread requested. Select this project's folder if prompted.", file=sys.stderr)
+        else:
+            print("[Codex IPC] Could not drive the desktop app automatically (needs macOS Accessibility permission). Please create a new thread manually.", file=sys.stderr)
+
+    print(f"[Codex IPC] 当前工程尚未绑定活跃会话。正在等待 Codex 新建会话: '{target_cwd}'", file=sys.stderr)
+    print("[Codex IPC] 请在 Codex 桌面端为本工程新建 Thread，检测到后会自动完成绑定。", file=sys.stderr)
+
+    reported_foreign: set[str] = set()
+    tty = sys.stderr.isatty()
     while time.time() - watch_start < timeout:
         time.sleep(0.5)
         elapsed = int(time.time() - watch_start)
-        if sys.stderr.isatty():
-            print(f"\r[Codex IPC] [侦测中 {elapsed:02d}s / {int(timeout)}s] 等待 Codex Desktop 新建会话... (点击 New Thread)", end="", file=sys.stderr)
+        if tty:
+            print(f"\r[Codex IPC] [侦测中 {elapsed:02d}s / {int(timeout)}s] 等待 Codex 新建会话...", end="", file=sys.stderr)
 
         for d in date_subdirs:
             if not d.is_dir():
@@ -328,27 +344,36 @@ def await_new_thread(
                     sid = meta.get("id")
                     if not sid or sid in initial_session_ids:
                         continue
-                    if meta.get("cwd") == target_cwd and meta.get("source") != "exec":
-                        save_project_binding("codex", sid, cwd=target_cwd)
-                        if sys.stderr.isatty():
-                            print("", file=sys.stderr)
-                        print(f"[Codex IPC] 监听到新会话诞生: [{sid}] -> 自动完成持久绑定！", file=sys.stderr)
-                        return {
-                            "id": sid,
-                            "name": "New Thread",
-                            "updated_at": "",
-                            "jsonl_path": str(rfile),
-                            "cwd": target_cwd,
-                            "source": meta.get("source"),
-                            "originator": meta.get("originator"),
-                            "mtime": st.st_mtime,
-                        }
+                    if meta.get("source") == "exec":
+                        continue
+                    if cwd_relation(meta.get("cwd"), target_cwd) is None:
+                        if sid not in reported_foreign:
+                            reported_foreign.add(sid)
+                            if tty:
+                                print("", file=sys.stderr)
+                            print(f"[Codex IPC] Ignoring new thread [{sid}] created in another folder: {meta.get('cwd')}", file=sys.stderr)
+                            print(f"   If it is meant for this project, bind it explicitly: codex-ipc --bind {sid}", file=sys.stderr)
+                        continue
+                    save_project_binding("codex", sid, cwd=target_cwd)
+                    if tty:
+                        print("", file=sys.stderr)
+                    print(f"[Codex IPC] 监听到新会话诞生: [{sid}] -> 自动完成持久绑定！", file=sys.stderr)
+                    return {
+                        "id": sid,
+                        "name": "New Thread",
+                        "updated_at": "",
+                        "jsonl_path": str(rfile),
+                        "cwd": meta.get("cwd") or target_cwd,
+                        "source": meta.get("source"),
+                        "originator": meta.get("originator"),
+                        "mtime": st.st_mtime,
+                    }
             except Exception as e:
                 if debug:
                     print(f"[Codex IPC Debug] Error polling new thread: {e}", file=sys.stderr)
                 continue
 
-    if sys.stderr.isatty():
+    if tty:
         print("", file=sys.stderr)
     print(f"[Codex IPC] Timed out waiting for new thread after {int(timeout)}s.", file=sys.stderr)
     return None
@@ -427,6 +452,33 @@ def read_latest_feedback(target: str | None = None, n: int = 1, only_final: bool
     return read_transcript_messages(jsonl_path, last_n=n, only_final=only_final)
 
 
+def _report_missing_session(target: str | None) -> None:
+    if target:
+        print(f"[Codex IPC] Error: No matching session found for target '{target}'.", file=sys.stderr)
+    else:
+        print(f"[Codex IPC] Error: No active Codex session matches current working directory '{os.getcwd()}'.", file=sys.stderr)
+        print("Please specify a target with `-s <session_id>` or run `codex-ipc --list`.", file=sys.stderr)
+
+
+def _resolve_or_await_session(
+    target: str | None,
+    pick_latest: bool,
+    auto_await_new: bool,
+    activate_gui: bool,
+    await_timeout: float,
+    debug: bool,
+) -> tuple[dict | None, str]:
+    """Shared session resolution for send / send-and-wait. Raises NeedsNewSessionError in non-TTY."""
+    session, status = match_session(target=target, pick_latest=pick_latest, debug=debug)
+    if session or status == "ambiguous":
+        return session, status
+    resolved_target, _ = resolve_target_session(target)
+    if resolved_target is None and auto_await_new:
+        session = await_new_thread(timeout=await_timeout, cwd=os.getcwd(), activate_gui=activate_gui, debug=debug)
+        return session, ("matched" if session else "none")
+    return None, status
+
+
 def send_message_to_codex(
     message: str,
     target: str | None = None,
@@ -435,38 +487,41 @@ def send_message_to_codex(
     pick_latest: bool = False,
     auto_await_new: bool = True,
     activate_gui: bool = False,
+    sender: str | None = None,
+    await_timeout: float = DEFAULT_AWAIT_TIMEOUT,
     debug: bool = False,
 ) -> bool:
-    """Send message to Codex session via `codex queue`."""
-    session, status = match_session(target=target, pick_latest=pick_latest, debug=debug)
+    """
+    Send message to Codex session via `codex queue`.
+    `codex queue` only accepts the text through argv (no shell is involved, so nothing is
+    evaluated), but argv is size-limited: oversized bodies are moved to a 0o600 payload file
+    and the queued message carries the envelope plus a pointer to that file.
+    """
+    session, status = _resolve_or_await_session(target, pick_latest, auto_await_new, activate_gui, await_timeout, debug)
     if not session:
-        if status == "ambiguous":
-            return False
-        resolved_target, _ = resolve_target_session(target)
-        if resolved_target is None and auto_await_new:
-            session = await_new_thread(timeout=60.0, cwd=os.getcwd(), activate_gui=activate_gui, debug=debug)
-
-    if not session:
-        if target:
-            print(f"[Codex IPC] Error: No matching session found for target '{target}'.", file=sys.stderr)
-        else:
-            print(f"[Codex IPC] Error: No active Codex session matches current working directory '{os.getcwd()}'.", file=sys.stderr)
-            print("Please specify a target with `-s <session_id>` or run `codex-ipc --list`.", file=sys.stderr)
+        if status != "ambiguous":
+            _report_missing_session(target)
         return False
 
     session_id = session["id"]
     display_name = session.get("name") or session_id
 
     # Wrap in Peer Envelope if not already wrapped
-    if not extract_nonce(message):
+    nonce = extract_nonce(message)
+    if not nonce:
         nonce = generate_nonce()
         message = format_peer_envelope(
             message=message,
             nonce=nonce,
-            sender="Antigravity",
+            sender=sender or detect_sender(),
             intent=intent,
             user_context=user_context,
+            reply_command=build_reply_command(),
         )
+
+    message, payload_path = spill_enveloped_message(message)
+    if payload_path:
+        print(f"[Codex IPC] Large payload moved to file-based pipeline: {payload_path}", file=sys.stderr)
 
     try:
         cmd = ["codex", "queue", "--thread", session_id, "--message", message]
@@ -475,7 +530,7 @@ def send_message_to_codex(
             print(f"[Codex IPC] `codex queue` failed (exit {result.returncode}): {result.stderr.strip()}", file=sys.stderr)
             return False
 
-        print(f"[Codex IPC] Message successfully queued to session \"{display_name}\" [{session_id}].")
+        print(f"[Codex IPC] Message successfully queued to session \"{display_name}\" [{session_id}] (Req-ID: {nonce}).")
         return True
     except Exception as e:
         print(f"[Codex IPC] Failed to execute `codex queue`: {e}", file=sys.stderr)
@@ -494,6 +549,8 @@ def send_file(
     pick_latest: bool = False,
     auto_await_new: bool = True,
     activate_gui: bool = False,
+    sender: str | None = None,
+    await_timeout: float = DEFAULT_AWAIT_TIMEOUT,
     debug: bool = False,
 ) -> bool | tuple[str | None, str | None]:
     """
@@ -515,29 +572,20 @@ def send_file(
     if prefix:
         content = f"{prefix.strip()}\n\n{content}"
 
-    if wait:
-        return send_and_wait(
-            content,
-            target=target,
-            timeout=timeout,
-            fast_fail_timeout=fast_fail_timeout,
-            intent=intent,
-            user_context=user_context,
-            pick_latest=pick_latest,
-            auto_await_new=auto_await_new,
-            activate_gui=activate_gui,
-            debug=debug,
-        )
-    return send_message_to_codex(
-        content,
+    common_kwargs = dict(
         target=target,
         intent=intent,
         user_context=user_context,
         pick_latest=pick_latest,
         auto_await_new=auto_await_new,
         activate_gui=activate_gui,
+        sender=sender,
+        await_timeout=await_timeout,
         debug=debug,
     )
+    if wait:
+        return send_and_wait(content, timeout=timeout, fast_fail_timeout=fast_fail_timeout, **common_kwargs)
+    return send_message_to_codex(content, **common_kwargs)
 
 
 def send_and_wait(
@@ -546,41 +594,38 @@ def send_and_wait(
     timeout: float = 300.0,
     fast_fail_timeout: float = 15.0,
     show_progress: bool = True,
-    sender_name: str = "Antigravity",
+    sender_name: str | None = None,
     intent: str = "Read-Only Review",
     user_context: str | None = None,
     pick_latest: bool = False,
     auto_await_new: bool = True,
     activate_gui: bool = False,
+    sender: str | None = None,
+    await_timeout: float = DEFAULT_AWAIT_TIMEOUT,
     debug: bool = False,
 ) -> tuple[str | None, str | None]:
     """
     Send message to Codex with correlation nonce and wait synchronously.
     Uses dual-channel listening:
-      1. Direct bi-directional Unix Domain Socket callback (~/.agent-pair/run/reply-<nonce>.sock)
-      2. Incremental TailReader on JSONL rollout transcript with fast-fail detection
-    
+      1. Duplex reply channel: ephemeral socket ~/.agent-pair/run/reply-<nonce>.sock (+ mailbox),
+         which the peer answers via `agent-pair-ipc reply --to <nonce>` (advertised in the envelope)
+      2. Fallback: incremental TailReader on JSONL rollout transcript with fast-fail detection
+
     Returns:
         tuple[response_text, verdict]
     """
-    session, status = match_session(target=target, pick_latest=pick_latest, debug=debug)
-    if not session:
-        if status == "ambiguous":
-            return None, None
-        resolved_target, _ = resolve_target_session(target)
-        if resolved_target is None and auto_await_new:
-            try:
-                session = await_new_thread(timeout=60.0, cwd=os.getcwd(), activate_gui=activate_gui, debug=debug)
-            except NeedsNewSessionError:
-                return None, "NEEDS_NEW_THREAD"
+    sender = sender or sender_name or detect_sender()
+    try:
+        session, status = _resolve_or_await_session(target, pick_latest, auto_await_new, activate_gui, await_timeout, debug)
+    except NeedsNewSessionError:
+        return None, "NEEDS_NEW_THREAD"
 
     if not session:
-        if target:
-            print(f"[Codex IPC] Error: No matching session found for target '{target}'.", file=sys.stderr)
-        else:
-            print(f"[Codex IPC] Error: No active Codex session matches current working directory '{os.getcwd()}'.", file=sys.stderr)
-            print("Please specify a target with `-s <session_id>` or run `codex-ipc --list`.", file=sys.stderr)
+        if status != "ambiguous":
+            _report_missing_session(target)
         return None, None
+
+    cleanup_stale_run_files()
 
     jsonl_path = session.get("jsonl_path")
     if not jsonl_path or not os.path.exists(jsonl_path):
@@ -592,21 +637,26 @@ def send_and_wait(
         initial_offset = os.path.getsize(jsonl_path)
 
     nonce = generate_nonce()
-    reply_server = EphemeralReplyServer(nonce=nonce, timeout=timeout)
+    reply_server = EphemeralReplyServer(
+        nonce=nonce,
+        timeout=timeout,
+        on_progress=print_progress_frame("Codex IPC Activity") if show_progress else None,
+    )
     reply_sock_path = None
     try:
         reply_sock_path = reply_server.start()
     except Exception as e:
         if debug:
-            print(f"[Codex IPC Debug] Could not start ephemeral reply server: {e}", file=sys.stderr)
+            print(f"[Codex IPC Debug] Could not start ephemeral reply server (mailbox still active): {e}", file=sys.stderr)
 
     full_message = format_peer_envelope(
         message=message,
         nonce=nonce,
-        sender=sender_name,
+        sender=sender,
         intent=intent,
         user_context=user_context,
         reply_socket=reply_sock_path,
+        reply_command=build_reply_command(),
     )
 
     try:
@@ -625,20 +675,19 @@ def send_and_wait(
         start_time = time.time()
         seen_tool_ids = set()
         found_request = False
+        reply_cmd_seen = False
         tail_reader = TailReader(jsonl_path, start_offset=initial_offset)
+        reply_marker = f"reply --to {nonce}"
 
         while time.time() - start_time < timeout:
-            time.sleep(0.5)
+            # Channel 1: duplex reply socket / mailbox (also serves as the loop's sleep)
+            r_resp, r_verdict = reply_server.poll_response(timeout=0.5)
+            if r_resp is not None:
+                if debug:
+                    print(f"[Codex IPC Debug] Response received via duplex channel ({reply_server.channel}).", file=sys.stderr)
+                return r_resp, r_verdict
 
-            # Dual-Channel 1: Check ephemeral reply socket first (direct bidirectional callback)
-            if reply_server:
-                r_resp, r_verdict = reply_server.poll_response(timeout=0.0)
-                if r_resp is not None:
-                    if debug:
-                        print(f"[Codex IPC Debug] Response received via ephemeral reply socket: {reply_sock_path}", file=sys.stderr)
-                    return r_resp, r_verdict
-
-            # Dual-Channel 2: Incremental JSONL transcript reading
+            # Channel 2: Incremental JSONL transcript reading
             if not jsonl_path or not os.path.exists(jsonl_path):
                 p = find_session_file(session["id"])
                 if p:
@@ -655,7 +704,8 @@ def send_and_wait(
                 print(f"\n[Codex IPC] Notice: Message is queued but was not consumed within {int(fast_fail_timeout)}s (Req-ID: {nonce}).", file=sys.stderr)
                 print(f"[Codex IPC] Target session \"{session.get('name')}\" [{session['id']}] might be inactive or busy executing another task.", file=sys.stderr)
                 print("[Codex IPC] NOTE: The message remains safely in Codex's internal queue; do NOT resend duplicate messages.", file=sys.stderr)
-                print(f"[Codex IPC] Action: Switch to Codex Desktop and activate session \"{session.get('name')}\", or run `codex-ipc -r` later to check for completion.\n", file=sys.stderr)
+                print(f"[Codex IPC] Action: Switch to Codex Desktop and activate session \"{session.get('name')}\", then collect the answer later with", file=sys.stderr)
+                print(f"           `agent-pair-ipc inbox {nonce}` (duplex reply) or `codex-ipc -r` (transcript).\n", file=sys.stderr)
                 return None, "QUEUED_UNCONSUMED"
 
             new_lines = tail_reader.read_new_lines()
@@ -664,46 +714,47 @@ def send_and_wait(
                     entry = json.loads(line)
                     etype = entry.get("type")
                     payload = entry.get("payload", {})
+                    ptype = payload.get("type")
 
                     # Step 1: Detect user queue/input message containing nonce
-                    if nonce in line:
+                    if not found_request and nonce in line:
                         found_request = True
                         if debug:
                             print(f"[Codex IPC Debug] Detected correlated request with nonce {nonce}", file=sys.stderr)
+                        continue
 
                     # Step 2: Track activity once request is queued
-                    if found_request and show_progress:
-                        ptype = payload.get("type")
-                        if etype == "response_item" and ptype in ("custom_tool_call", "function_call"):
-                            call_id = payload.get("call_id") or payload.get("id")
-                            tool_name = payload.get("name", "tool")
-                            if call_id and call_id not in seen_tool_ids:
-                                seen_tool_ids.add(call_id)
-                                print(f"[Codex IPC Activity] Running tool: {tool_name}...", file=sys.stderr)
-                        elif payload.get("type") == "item_completed":
-                            item = payload.get("item", {})
-                            if item.get("type") == "Reasoning":
-                                rid = item.get("id")
-                                if rid and rid not in seen_tool_ids:
-                                    seen_tool_ids.add(rid)
-                                    print("[Codex IPC Activity] Reasoning in progress...", file=sys.stderr)
+                    if found_request and etype == "response_item" and ptype in ("custom_tool_call", "function_call", "local_shell_call"):
+                        if reply_marker in line:
+                            reply_cmd_seen = True
+                        call_id = payload.get("call_id") or payload.get("id")
+                        tool_name = payload.get("name", "tool")
+                        if show_progress and call_id and call_id not in seen_tool_ids:
+                            seen_tool_ids.add(call_id)
+                            print(f"[Codex IPC Activity] Running tool: {tool_name}...", file=sys.stderr)
+                    elif found_request and show_progress and ptype == "item_completed":
+                        item = payload.get("item", {})
+                        if item.get("type") == "Reasoning":
+                            rid = item.get("id")
+                            if rid and rid not in seen_tool_ids:
+                                seen_tool_ids.add(rid)
+                                print("[Codex IPC Activity] Reasoning in progress...", file=sys.stderr)
 
                     # Step 3: Detect completion
                     if found_request:
-                        if etype == "event_msg" and payload.get("type") == "task_complete":
-                            last_msg = payload.get("last_agent_message")
-                            if last_msg:
-                                verdict = extract_verdict(last_msg)
-                                return last_msg.strip(), verdict
-
-                        elif etype == "response_item" and payload.get("type") == "message":
+                        final_text = None
+                        if etype == "event_msg" and ptype == "task_complete":
+                            final_text = (payload.get("last_agent_message") or "").strip()
+                        elif etype == "response_item" and ptype == "message":
                             if payload.get("role") == "assistant" and payload.get("phase") == "final_answer":
                                 content = payload.get("content", [])
                                 texts = [c.get("text", "") for c in content if c.get("type") in ("output_text", "Text")]
-                                full_text = "\n".join(texts).strip()
-                                if full_text:
-                                    verdict = extract_verdict(full_text)
-                                    return full_text, verdict
+                                final_text = "\n".join(texts).strip()
+                        if final_text:
+                            text, verdict, channel = settle_duplex_reply(reply_server, final_text, reply_cmd_seen)
+                            if debug:
+                                print(f"[Codex IPC Debug] Final answer taken from {channel}.", file=sys.stderr)
+                            return text, verdict
 
                 except Exception as parse_err:
                     if debug:
@@ -711,10 +762,10 @@ def send_and_wait(
                     continue
 
         print(f"[Codex IPC] Timed out waiting for response after {int(timeout)}s (Req-ID: {nonce}).", file=sys.stderr)
+        print(f"[Codex IPC] A late reply will be kept in the mailbox: agent-pair-ipc inbox {nonce}", file=sys.stderr)
         return None, None
     finally:
-        if reply_server:
-            reply_server.close()
+        reply_server.close()
 
 
 def list_sessions(debug: bool = False):
@@ -733,8 +784,11 @@ def list_sessions(debug: bool = False):
     for s in sessions:
         enrich_session_info(s)
         tags = []
-        if s.get("cwd") == current_cwd:
+        relation = cwd_relation(s.get("cwd"), current_cwd)
+        if relation == "exact":
             tags.append("Current Project")
+        elif relation == "ancestor":
+            tags.append("Parent of CWD")
         if bound_id and (s["id"] == bound_id or s["id"].startswith(bound_id)):
             tags.append("Bound Target")
         tag_str = f" [{', '.join(tags)}]" if tags else ""
@@ -772,25 +826,35 @@ def build_parser() -> argparse.ArgumentParser:
 
   # 6. Deliver report picking latest if multiple sessions exist:
   codex-ipc -w --pick-latest -f docs/reports/REVIEW_REQUEST.md
+
+  # 7. Rich text without shell escaping: quoted heredoc piped through stdin
+  codex-ipc -w -f - <<'AP_EOF'
+  Review `proxy.yaml` rule AND,((DOMAIN-SUFFIX,example.com)) and $VARS verbatim.
+  AP_EOF
+
+  # 8. Collect a reply that arrived after the wait ended (e.g. after fast-fail):
+  agent-pair-ipc inbox req_0123456789ab
 """
     )
     parser.add_argument("message", nargs="?", default=None, help="Message text or target session if -m/-f/stdin is provided")
     parser.add_argument("target_pos", nargs="?", default=None, help="Target session ID or title (positional alternative to -s/--session)")
     parser.add_argument("-m", "--msg", dest="msg_flag", default=None, help="Explicit message text to send")
-    parser.add_argument("-f", "--file", dest="file_path", default=None, help="Path to file whose content should be sent as message")
+    parser.add_argument("-f", "--file", dest="file_path", default=None, help="Path to file whose content should be sent as message ('-' reads stdin; recommended for rich text)")
     parser.add_argument("--prefix", dest="prefix", default=None, help="Optional text prefix to prepend before file/stdin content")
     parser.add_argument("-s", "--session", dest="session_target", default=None, help="Target session ID or title")
     parser.add_argument("--bind", dest="bind_target", default=None, help="Bind target session ID to current project in .agent-pair/bindings.json")
     parser.add_argument("--unbind", action="store_true", help="Remove the project session binding in .agent-pair/bindings.json")
     parser.add_argument("--pick-latest", action="store_true", help="Pick the latest session if multiple match current project CWD")
-    parser.add_argument("--await-new-thread", action="store_true", help="Wait for a new thread to be created in Codex Desktop, auto-bind and send")
+    parser.add_argument("--await-new-thread", "--await-new-session", dest="await_new_thread", action="store_true", help="Wait for a new thread to be created in Codex Desktop, auto-bind and send (works in non-TTY)")
+    parser.add_argument("--await-timeout", type=float, default=DEFAULT_AWAIT_TIMEOUT, help=f"Seconds to wait for a new thread (default: {int(DEFAULT_AWAIT_TIMEOUT)})")
     parser.add_argument("-l", "--list", action="store_true", help="List recent Codex sessions")
     parser.add_argument("-r", "--read", action="store_true", help="Read the latest assistant feedback/response from target session")
     parser.add_argument("-a", "--all-turns", action="store_true", help="Include intermediate turns when reading transcript (default: final turns only)")
     parser.add_argument("-n", "--number", type=int, default=1, help="Number of assistant turns to read (default: 1)")
-    parser.add_argument("-g", "--activate-gui", action="store_true", help="Activate Codex Desktop application (and open new tab if creating new session)")
+    parser.add_argument("-g", "--activate-gui", action="store_true", help="Activate the Codex desktop app and trigger its new-thread action when waiting for a new thread")
     parser.add_argument("--intent", default="Read-Only Review", help="Peer cooperation intent declaration (default: 'Read-Only Review')")
     parser.add_argument("--user-context", default=None, help="User prompt authorization context to pass in peer envelope")
+    parser.add_argument("--sender", default=None, help="Sender name in the peer envelope (default: $AGENT_PAIR_SENDER or auto-detected)")
     parser.add_argument("-w", "--wait", action="store_true", help="Send message and synchronously wait for Codex response")
     parser.add_argument("-t", "--timeout", type=float, default=300.0, help="Wait timeout in seconds (default: 300)")
     parser.add_argument("--fast-fail", type=float, default=15.0, help="Fast fail timeout in seconds if nonce not consumed (default: 15.0)")
@@ -834,7 +898,7 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.await_new_thread:
         try:
-            new_sess = await_new_thread(timeout=60.0, require_tty=False, activate_gui=args.activate_gui, debug=args.debug)
+            new_sess = await_new_thread(timeout=args.await_timeout, require_tty=False, activate_gui=args.activate_gui, debug=args.debug)
             if not new_sess:
                 return EXIT_ERROR
             target = new_sess["id"]
@@ -855,6 +919,8 @@ def main(argv: list[str] | None = None) -> int:
         return EXIT_ERROR
 
     target = resolved_target
+    if args.msg_flag is not None:
+        warn_inline_rich_text(msg_text)
 
     if args.wait:
         resp, verdict = send_and_wait(
@@ -867,6 +933,8 @@ def main(argv: list[str] | None = None) -> int:
             pick_latest=args.pick_latest,
             auto_await_new=not args.no_auto_new,
             activate_gui=args.activate_gui,
+            sender=args.sender,
+            await_timeout=args.await_timeout,
             debug=args.debug,
         )
         if verdict == "QUEUED_UNCONSUMED":
@@ -894,6 +962,8 @@ def main(argv: list[str] | None = None) -> int:
             pick_latest=args.pick_latest,
             auto_await_new=not args.no_auto_new,
             activate_gui=args.activate_gui,
+            sender=args.sender,
+            await_timeout=args.await_timeout,
             debug=args.debug,
         )
         return EXIT_SIGN_OFF if ok else EXIT_ERROR
