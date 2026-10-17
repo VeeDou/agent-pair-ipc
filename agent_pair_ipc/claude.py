@@ -21,11 +21,13 @@ from agent_pair_ipc.common import (
     EXIT_ERROR,
     EXIT_NEEDS_NEW_THREAD,
     EXIT_NO_VERDICT,
+    EXIT_QUEUED_UNCONSUMED,
     EXIT_SIGN_OFF,
     EphemeralReplyServer,
     NeedsNewSessionError,
     TailReader,
     build_reply_command,
+    check_artifact_stable,
     cleanup_stale_run_files,
     cwd_relation,
     detect_sender,
@@ -33,6 +35,7 @@ from agent_pair_ipc.common import (
     filter_project_sessions,
     format_peer_envelope,
     generate_nonce,
+    is_pid_alive,
     load_project_bindings,
     open_new_gui_session,
     print_progress_frame,
@@ -413,6 +416,8 @@ def send_message_to_claude(
     target: str | None = None,
     intent: str = "Read-Only Review",
     user_context: str | None = None,
+    expected_artifact: str | None = None,
+    reply_socket: str | None = None,
     pick_latest: bool = False,
     auto_await_new: bool = True,
     activate_gui: bool = False,
@@ -424,6 +429,7 @@ def send_message_to_claude(
     Send message to target Claude Code session via Unix Domain Socket.
     Messages not yet enveloped are wrapped in a Peer Envelope that tells the peer how to answer
     with `agent-pair-ipc reply --to <nonce>`; a reply sent while nobody waits lands in the mailbox.
+    Attaches handshake metadata (ipc_version, request_id, caller, expected_artifact, callback_socket).
     """
     session, status = _resolve_or_await_session(target, pick_latest, auto_await_new, activate_gui, await_timeout, debug)
     if not session:
@@ -444,8 +450,22 @@ def send_message_to_claude(
             sender=sender or detect_sender(),
             intent=intent,
             user_context=user_context,
+            reply_socket=reply_socket,
             reply_command=build_reply_command(),
+            expected_artifact=expected_artifact,
         )
+
+    # Standardized Handshake Metadata
+    caller_name = sender or detect_sender()
+    metadata: dict[str, str] = {
+        "ipc_version": "2.1",
+        "request_id": nonce,
+        "caller": caller_name,
+    }
+    if expected_artifact:
+        metadata["expected_artifact"] = str(expected_artifact)
+    if reply_socket:
+        metadata["callback_socket"] = str(reply_socket)
 
     try:
         s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -453,7 +473,14 @@ def send_message_to_claude(
         s.connect(sock_path)
 
         auth_msg = json.dumps({"type": "auth", "token": token}) + "\n"
-        user_msg = json.dumps({"type": "user", "message": {"role": "user", "content": message}}) + "\n"
+        user_msg = json.dumps({
+            "type": "user",
+            "message": {
+                "role": "user",
+                "content": message,
+                "metadata": metadata,
+            }
+        }) + "\n"
 
         s.sendall(auth_msg.encode("utf-8"))
         s.sendall(user_msg.encode("utf-8"))
@@ -469,6 +496,8 @@ def send_message_to_claude(
         display_name = session["name"] or session["session_id"]
         sess_id = session["host_session_id"] or session["session_id"]
         print(f"[Claude Code IPC] Message successfully delivered to session PID {session['pid']} ({display_name}) [ID: {sess_id}] (Req-ID: {nonce}).")
+        if expected_artifact:
+            print(f"[Claude Code IPC] Handshake: Expected artifact registered -> {expected_artifact}", file=sys.stderr)
         if session.get("status") == "busy":
             print("[Claude Code IPC] Note: Target session is busy; the message will be processed after its current turn.", file=sys.stderr)
         if session.get("entrypoint") == "claude-desktop":
@@ -485,6 +514,8 @@ def send_file(
     prefix: str | None = None,
     wait: bool = False,
     timeout: float = 300.0,
+    fast_fail_timeout: float = 45.0,
+    expect_file: str | Path | None = None,
     intent: str = "Read-Only Review",
     user_context: str | None = None,
     pick_latest: bool = False,
@@ -525,8 +556,18 @@ def send_file(
         debug=debug,
     )
     if wait:
-        return send_and_wait(content, timeout=timeout, **common_kwargs)
-    return send_message_to_claude(content, **common_kwargs)
+        return send_and_wait(
+            content,
+            timeout=timeout,
+            fast_fail_timeout=fast_fail_timeout,
+            expect_file=expect_file,
+            **common_kwargs
+        )
+    return send_message_to_claude(
+        content,
+        expected_artifact=str(expect_file) if expect_file else None,
+        **common_kwargs
+    )
 
 
 def read_transcript_messages(transcript_path: str | None, last_n: int = 1, only_final: bool = True) -> list[dict]:
@@ -591,6 +632,8 @@ def send_and_wait(
     message: str,
     target: str | None = None,
     timeout: float = 300.0,
+    fast_fail_timeout: float = 45.0,
+    expect_file: str | Path | None = None,
     show_progress: bool = True,
     sender_name: str | None = None,
     intent: str = "Read-Only Review",
@@ -604,10 +647,12 @@ def send_and_wait(
 ) -> tuple[str | None, str | None]:
     """
     Send message to Claude Code with request correlation nonce and wait synchronously.
-    Uses dual-channel listening:
+    Uses multi-channel listening:
       1. Duplex reply channel: ephemeral socket ~/.agent-pair/run/reply-<nonce>.sock (+ mailbox),
          which the peer answers via `agent-pair-ipc reply --to <nonce>` (advertised in the envelope)
-      2. Fallback: incremental TailReader on the JSONL transcript
+      2. Fast-fail checks: target PID liveness & socket liveness
+      3. Expected artifact auto-detection: checks if `expect_file` has been written and stabilized
+      4. Incremental TailReader on the JSONL transcript with unconsumed fast-fail protection
 
     Returns:
         tuple[response_text, verdict]
@@ -625,10 +670,26 @@ def send_and_wait(
 
     cleanup_stale_run_files()
 
+    expect_path: Path | None = None
+    initial_mtime = 0.0
+    initial_size = 0
+    if expect_file:
+        expect_path = Path(expect_file).expanduser().resolve()
+        if expect_path.is_file():
+            try:
+                st = expect_path.stat()
+                initial_mtime = st.st_mtime
+                initial_size = st.st_size
+            except Exception:
+                pass
+
     transcript_path = session.get("transcript_path")
     initial_offset = 0
     if transcript_path and os.path.exists(transcript_path):
-        initial_offset = os.path.getsize(transcript_path)
+        try:
+            initial_offset = os.path.getsize(transcript_path)
+        except OSError:
+            initial_offset = 0
 
     # Attach unique correlation nonce and start ephemeral reply server
     nonce = generate_nonce()
@@ -652,12 +713,15 @@ def send_and_wait(
         user_context=user_context,
         reply_socket=reply_sock_path,
         reply_command=build_reply_command(),
+        expected_artifact=str(expect_path) if expect_path else (str(expect_file) if expect_file else None),
     )
 
     try:
         ok = send_message_to_claude(
             full_message,
             target=session["host_session_id"] or str(session["pid"]),
+            expected_artifact=str(expect_path) if expect_path else (str(expect_file) if expect_file else None),
+            reply_socket=reply_sock_path,
             pick_latest=pick_latest,
             auto_await_new=False,
             activate_gui=False,
@@ -670,7 +734,9 @@ def send_and_wait(
 
         start_time = time.time()
         seen_tool_ids = set()
+        is_enqueued = False
         found_request = False
+        warned_busy = False
         reply_cmd_seen = False
         warned_idle = False
         warned_delivery = False
@@ -685,76 +751,120 @@ def send_and_wait(
                     print(f"[Claude Code IPC Debug] Response received via duplex channel ({reply_server.channel}).", file=sys.stderr)
                 return r_resp, r_verdict
 
-            # Channel 2: transcript fallback
+            # Channel 2: Fast-fail checks (PID and socket liveness)
+            pid = session.get("pid")
+            if pid and not is_pid_alive(pid):
+                print(f"\n[Claude Code IPC] Fast-fail: Target Claude process PID {pid} is no longer running.", file=sys.stderr)
+                return None, "PROCESS_TERMINATED"
+
+            sock_path = session.get("socket_path")
+            if sock_path and not os.path.exists(sock_path):
+                print(f"\n[Claude Code IPC] Fast-fail: Target Claude socket disappeared: {sock_path}", file=sys.stderr)
+                return None, "SOCKET_DISAPPEARED"
+
+            # Channel 3: Expected deliverable auto-detection
+            if expect_path:
+                ready, art_content, art_verdict = check_artifact_stable(
+                    expect_path,
+                    initial_mtime=initial_mtime,
+                    initial_size=initial_size,
+                    min_stable_seconds=3.0,
+                    require_verdict=True,
+                )
+                if ready and art_content:
+                    print(f"\n[Claude Code IPC] Detected completed deliverable with verdict [{art_verdict}]: {expect_path} ({len(art_content)} bytes).", file=sys.stderr)
+                    return art_content, art_verdict
+
+            # Channel 4: Incremental JSONL transcript reading
             if not transcript_path or not os.path.exists(transcript_path):
                 transcript_path = find_transcript_path(session.get("cwd", ""), session.get("session_id", ""))
-                if not transcript_path or not os.path.exists(transcript_path):
-                    continue
-                session["transcript_path"] = transcript_path
-                tail_reader.set_file(transcript_path, start_offset=0)
+                if transcript_path and os.path.exists(transcript_path):
+                    session["transcript_path"] = transcript_path
+                    tail_reader.set_file(transcript_path, start_offset=0)
+
+            if transcript_path and os.path.exists(transcript_path):
+                for line in tail_reader.read_new_lines():
+                    # Confirmation of enqueue: Claude Code records queue-operation/enqueue immediately on socket write
+                    if not is_enqueued and nonce in line:
+                        is_enqueued = True
+                        if debug:
+                            print(f"[Claude Code IPC Debug] Request confirmed enqueued (nonce {nonce} in transcript).", file=sys.stderr)
+
+                    try:
+                        entry = json.loads(line)
+                        msg = entry.get("message", {})
+                        role = msg.get("role")
+
+                        # Step 1: Detect user message with correlation nonce (turn actually began)
+                        if role == "user":
+                            content_val = msg.get("content", "")
+                            raw_content = ""
+                            if isinstance(content_val, list):
+                                for p in content_val:
+                                    if isinstance(p, dict) and p.get("type") == "text":
+                                        raw_content += p.get("text", "")
+                            elif isinstance(content_val, str):
+                                raw_content = content_val
+
+                            if nonce in raw_content:
+                                is_enqueued = True
+                                found_request = True
+                                if debug:
+                                    print(f"[Claude Code IPC Debug] Correlated user turn started for nonce {nonce}", file=sys.stderr)
+
+                        # Step 2: Once correlated request is identified, track assistant tools and final completion
+                        elif found_request and role == "assistant":
+                            for c in msg.get("content", []):
+                                if isinstance(c, dict) and c.get("type") == "tool_use":
+                                    if reply_marker in json.dumps(c.get("input", {}), ensure_ascii=False):
+                                        reply_cmd_seen = True
+                                    tid = c.get("id")
+                                    tname = c.get("name")
+                                    if show_progress and tid and tid not in seen_tool_ids:
+                                        seen_tool_ids.add(tid)
+                                        print(f"[Claude Code IPC] Running tool: {tname}...", file=sys.stderr)
+
+                            # Completion check
+                            stop_reason = msg.get("stop_reason")
+                            if stop_reason and stop_reason != "tool_use":
+                                texts = []
+                                for part in msg.get("content", []):
+                                    if isinstance(part, dict) and part.get("type") == "text":
+                                        texts.append(part.get("text", ""))
+                                full_text = "\n".join(texts).strip()
+                                if full_text:
+                                    text, verdict, channel = settle_duplex_reply(reply_server, full_text, reply_cmd_seen)
+                                    if debug:
+                                        print(f"[Claude Code IPC Debug] Final answer taken from {channel}.", file=sys.stderr)
+                                    return text, verdict
+
+                    except Exception as parse_err:
+                        if debug:
+                            print(f"[Claude Code IPC Debug] Error parsing line: {parse_err}", file=sys.stderr)
+                        continue
 
             elapsed = time.time() - start_time
 
-            if not found_request and elapsed > 25.0 and not warned_delivery:
+            # Fast-fail: Request was not even enqueued in transcript after fast_fail_timeout
+            if not is_enqueued and fast_fail_timeout > 0 and elapsed > fast_fail_timeout:
+                print(f"\n[Claude Code IPC] Notice: Message was delivered to socket but not enqueued within {int(fast_fail_timeout)}s (Req-ID: {nonce}).", file=sys.stderr)
+                print(f"[Claude Code IPC] Target session \"{session.get('name')}\" [PID: {session['pid']}] may be suspended in background or inactive.", file=sys.stderr)
+                print("[Claude Code IPC] NOTE: If the session was asleep, switch to Claude Desktop to wake it up.", file=sys.stderr)
+                print(f"[Claude Code IPC] Action: Check later using `agent-pair-ipc inbox {nonce}` or `claude-ipc -r`.\n", file=sys.stderr)
+                return None, "QUEUED_UNCONSUMED"
+
+            # Inform if enqueued and waiting for busy previous turn
+            if is_enqueued and not found_request and not warned_busy and elapsed > 10.0:
+                warned_busy = True
+                print(f"[Claude Code IPC] Notice: Message is safely queued in session. Peer is busy processing previous turn; waiting for turn to start...", file=sys.stderr)
+
+            if not is_enqueued and elapsed > 25.0 and not warned_delivery:
                 warned_delivery = True
                 print(f"[Claude Code IPC] Notice: Request nonce {nonce} has not appeared in transcript after 25s. Peer session may be busy or inactive.", file=sys.stderr)
 
-            if session.get("entrypoint") == "claude-desktop" and not warned_idle and elapsed > 8.0 and not found_request:
+            if session.get("entrypoint") == "claude-desktop" and not warned_idle and elapsed > 8.0 and not is_enqueued:
                 warned_idle = True
                 print("[Claude Code IPC] Notice: Claude Desktop has not started processing yet. If window is in background, switch to it to wake it up.", file=sys.stderr)
-
-            for line in tail_reader.read_new_lines():
-                try:
-                    entry = json.loads(line)
-                    msg = entry.get("message", {})
-                    role = msg.get("role")
-
-                    # Step 1: Detect user message with our correlation nonce
-                    if role == "user":
-                        content_val = msg.get("content", "")
-                        raw_content = ""
-                        if isinstance(content_val, list):
-                            for p in content_val:
-                                if isinstance(p, dict) and p.get("type") == "text":
-                                    raw_content += p.get("text", "")
-                        elif isinstance(content_val, str):
-                            raw_content = content_val
-
-                        if nonce in raw_content:
-                            found_request = True
-                            if debug:
-                                print(f"[Claude Code IPC Debug] Found correlated user request with nonce {nonce}", file=sys.stderr)
-
-                    # Step 2: Once correlated request is identified, track assistant tools and final completion
-                    elif found_request and role == "assistant":
-                        for c in msg.get("content", []):
-                            if isinstance(c, dict) and c.get("type") == "tool_use":
-                                if reply_marker in json.dumps(c.get("input", {}), ensure_ascii=False):
-                                    reply_cmd_seen = True
-                                tid = c.get("id")
-                                tname = c.get("name")
-                                if show_progress and tid and tid not in seen_tool_ids:
-                                    seen_tool_ids.add(tid)
-                                    print(f"[Claude Code IPC] Running tool: {tname}...", file=sys.stderr)
-
-                        # Completion check
-                        stop_reason = msg.get("stop_reason")
-                        if stop_reason and stop_reason != "tool_use":
-                            texts = []
-                            for part in msg.get("content", []):
-                                if isinstance(part, dict) and part.get("type") == "text":
-                                    texts.append(part.get("text", ""))
-                            full_text = "\n".join(texts).strip()
-                            if full_text:
-                                text, verdict, channel = settle_duplex_reply(reply_server, full_text, reply_cmd_seen)
-                                if debug:
-                                    print(f"[Claude Code IPC Debug] Final answer taken from {channel}.", file=sys.stderr)
-                                return text, verdict
-
-                except Exception as parse_err:
-                    if debug:
-                        print(f"[Claude Code IPC Debug] Error parsing line: {parse_err}", file=sys.stderr)
-                    continue
 
         print(f"[Claude Code IPC] Timed out waiting for response after {int(timeout)}s (Req-ID: {nonce}).", file=sys.stderr)
         print(f"[Claude Code IPC] A late reply will be kept in the mailbox: agent-pair-ipc inbox {nonce}", file=sys.stderr)
@@ -848,8 +958,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--intent", default="Read-Only Review", help="Peer cooperation intent declaration (default: 'Read-Only Review')")
     parser.add_argument("--user-context", default=None, help="User prompt authorization context to pass in peer envelope")
     parser.add_argument("--sender", default=None, help="Sender name in the peer envelope (default: $AGENT_PAIR_SENDER or auto-detected)")
-    parser.add_argument("-w", "--wait", action="store_true", help="Send message and synchronously wait for Claude Code's response")
-    parser.add_argument("-t", "--timeout", type=float, default=300.0, help="Wait timeout in seconds (default: 300)")
+    parser.add_argument("-w", "--wait", action="store_true", help="Send message and synchronously wait for Claude Code response")
+    parser.add_argument("-t", "--timeout", "--wait-timeout", dest="timeout", type=float, default=300.0, help="Wait timeout in seconds (default: 300)")
+    parser.add_argument("--expect-file", "--output-file", dest="expect_file", default=None, help="Expected deliverable file path. Auto-detects completion when file settles with verdict.")
+    parser.add_argument("--fast-fail-timeout", type=float, default=45.0, help="Fast fail timeout in seconds if request is not even enqueued (default: 45.0, 0 to disable)")
     parser.add_argument("--debug", action="store_true", help="Enable verbose debug logs")
     return parser
 
@@ -913,11 +1025,15 @@ def main(argv: list[str] | None = None) -> int:
     if args.msg_flag is not None:
         warn_inline_rich_text(msg_text)
 
-    if args.wait:
+    is_wait = args.wait or bool(args.expect_file)
+
+    if is_wait:
         resp, verdict = send_and_wait(
             msg_text,
             target=target,
             timeout=args.timeout,
+            fast_fail_timeout=args.fast_fail_timeout,
+            expect_file=args.expect_file,
             intent=args.intent,
             user_context=args.user_context,
             pick_latest=args.pick_latest,
@@ -927,8 +1043,12 @@ def main(argv: list[str] | None = None) -> int:
             await_timeout=args.await_timeout,
             debug=args.debug,
         )
+        if verdict == "QUEUED_UNCONSUMED":
+            return EXIT_QUEUED_UNCONSUMED
         if verdict == "NEEDS_NEW_THREAD":
             return EXIT_NEEDS_NEW_THREAD
+        if verdict in ("PROCESS_TERMINATED", "SOCKET_DISAPPEARED"):
+            return EXIT_ERROR
         if resp is not None:
             print("\n=== [Claude Code Response] ===")
             print(resp)
@@ -947,6 +1067,7 @@ def main(argv: list[str] | None = None) -> int:
             target=target,
             intent=args.intent,
             user_context=args.user_context,
+            expected_artifact=args.expect_file,
             pick_latest=args.pick_latest,
             auto_await_new=not args.no_auto_new,
             activate_gui=args.activate_gui,

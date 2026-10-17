@@ -50,7 +50,13 @@ AP_EOF
 
 ### 场景 A：交付复核并等待结论（最常用）
 ```bash
+# 基础阻塞等待（默认 300s，自动追踪转录与回调通道）：
 agent-pair-ipc claude -w -f docs/reports/REVIEW_REQUEST.md
+
+# 推荐：指定预期交付物文件（产物写入稳定且含 VERDICT 时毫秒级唤醒退出）：
+agent-pair-ipc claude -w -t 300 --expect-file docs/reports/CLAUDE_REVIEW.md -f docs/reports/REVIEW_REQUEST.md
+
+# 带前缀提示：
 agent-pair-ipc claude -w --prefix "【Antigravity】本期全部完成，请独立复核" -f docs/reports/REVIEW_REQUEST.md
 ```
 
@@ -75,7 +81,7 @@ claude-ipc --unbind                                             # 解除绑定
 claude-ipc -w --pick-latest -f docs/reports/REVIEW_REQUEST.md   # 多会话时使用最新一条
 ```
 
-### 场景 E：非阻塞异步发送（Fire-and-forget）与稍后取回
+### 场景 E：非阻塞异步发送（仅限通知类消息）与稍后取回
 ```bash
 agent-pair-ipc claude -f - <<'AP_EOF'
 【Antigravity】通知：后台测试正在运行中，预计 2 分钟后交付
@@ -110,21 +116,27 @@ agent-pair-ipc claude -l
 
 ---
 
-## 5. 标准结对作业程序（SOP）
+## 5. 标准结对作业程序（SOP 契约）
 
-1. **自测完备**：本地测试通过、门禁绿灯，准备证据（命令与输出）。
+1. **自测完备**：本地测试通过、门禁绿灯，准备客观证据（命令与输出）。
 2. **起草交付包**：原始目标、已实施内容、客观证据、未确定事项、可一键重跑的复核命令；写入文件。
-3. **调用本 Skill 交付**：`-w -f <报告文件>`；可加 `--user-context "<用户原话>"` 如实声明用户授权上下文（不得编造）。
-4. **获取复核结论**：输出 `=== [Claude Code Response] ===` 后，提炼结论向用户汇报，**并停下来等待用户裁决**。
+3. **闭环交付铁律（严禁裸发）**：
+   - 凡是将代码、设计方案或测试报告交由 Claude Code 复核，**必须附加 `-w`（阻塞等待模式）**。
+   - 如果约定由 Claude Code 生成复核文件（如 `*_REVIEW.md`），**必须同时附加 `--expect-file <路径>`**，以开启产物稳定捕获（产物含 VERDICT 且写入静默 3 秒后即时返回）。
+     > [!NOTE] `--expect-file` 专门用于约定输出包含 `VERDICT: SIGN_OFF` 或 `VERDICT: CHANGES_REQUESTED` 判定行的最终评审产物；对于无需 VERDICT 的非评审类文档（如普通设计方案或草稿），调用方请通过转录流或回调通道获取结论。
+   - **禁止**以非阻塞方式（不带 `-w`）发送后直接对用户回复“已提交复核，静候答复”并结束回合，避免发生长达数小时的协作死寂。
+   - 可加 `--user-context "<用户原话>"` 如实声明用户授权上下文（不得编造）。
+4. **获取复核结论**：脚本返回 Exit 0/2 并输出 `=== [Claude Code Response] ===` 后，提炼结论向用户汇报，**并停下来等待用户裁决**。若遇到未消费超时或会话挂起（Exit 4），使用 `agent-pair-ipc inbox <Req-ID>` 取件或切换前台唤醒会话重新等待。
 
 ---
 
 ## 6. 退出码契约（Exit Codes）
 
 - `0` (`EXIT_SIGN_OFF`)：复核通过，最终行为 `VERDICT: SIGN_OFF`（`reply` 成功投递/入箱也返回 0）。
-- `1` (`EXIT_ERROR`)：执行错误、目标找不到或超时。
+- `1` (`EXIT_ERROR`)：执行错误、进程崩溃（`PROCESS_TERMINATED`）、Socket 消失（`SOCKET_DISAPPEARED`）或常规超时。
 - `2` (`EXIT_CHANGES_REQUESTED`)：复核退回，最终行为 `VERDICT: CHANGES_REQUESTED`。
 - `3` (`EXIT_NO_VERDICT`)：对方完成回答但未包含格式化 VERDICT 行。
+- `4` (`EXIT_QUEUED_UNCONSUMED`)：请求在 `fast_fail_timeout` 内未能确认进入对端队列（窗口后台休眠或未获焦点，可切换窗口激活，并可通过 `agent-pair-ipc inbox <Req-ID>` 取件）。
 - `5` (`EXIT_NEEDS_NEW_THREAD`)：新工程无会话且运行于非交互环境，提示用户新建会话或改用 `--await-new-session`。
 
 ---
@@ -133,7 +145,10 @@ agent-pair-ipc claude -l
 
 | 参数 | 说明 | 示例 |
 |---|---|---|
-| `-w`, `--wait` | 阻塞等待对方完成，打印最终结论（回调通道优先，转录兜底） | `-w` |
+| `-w`, `--wait` | 阻塞等待对方完成并打印结论（布尔开关） | `-w` |
+| `-t`, `--timeout`, `--wait-timeout` | 等待超时秒数（默认 300） | `-t 180` |
+| `--expect-file` / `--output-file` | 期望产物文件路径；产物生成稳定且含 VERDICT 时立即退出返回 | `--expect-file docs/CLAUDE_REVIEW.md` |
+| `--fast-fail-timeout` | 对方未入队请求时的快速失败熔断秒数（默认 45s，0 为禁用） | `--fast-fail-timeout 45` |
 | `-f`, `--file` | 读取文件作为消息；`-f -` 读取 stdin（推荐配合 `<<'AP_EOF'`） | `-f report.md` |
 | `-m`, `--msg` | 短文本内联（富文本请改用 `-f`） | `-m "请复核"` |
 | `--prefix` | 在文件或 stdin 内容前拼接提示前缀 | `--prefix "【提示】"` |
@@ -148,7 +163,6 @@ agent-pair-ipc claude -l
 | `--user-context` | 如实引用用户原话作为授权上下文 | `--user-context "把这个拿给Claude code审核"` |
 | `--sender` | 信封中的发送方名称（默认 `$AGENT_PAIR_SENDER` 或自动识别） | `--sender Antigravity` |
 | `-r`, `--read` / `-n` / `-a` | 读取最新回复 / 条数 / 含中间工具轮次 | `-r -n 3` |
-| `-t`, `--timeout` | 等待超时秒数（默认 300） | `-t 180` |
 | `-l`, `--list` | 列出活跃会话、状态、socket 与转录路径 | `-l` |
 
 脚本入口：`agent-pair-ipc claude ...`、`claude-ipc ...`，或本 Skill 内的 `python3 scripts/claude_code_ipc.py ...`（三者等价）。

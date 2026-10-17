@@ -27,6 +27,7 @@ from agent_pair_ipc.common import (
     NeedsNewSessionError,
     TailReader,
     build_reply_command,
+    check_artifact_stable,
     cleanup_stale_run_files,
     cwd_relation,
     detect_sender,
@@ -484,6 +485,8 @@ def send_message_to_codex(
     target: str | None = None,
     intent: str = "Read-Only Review",
     user_context: str | None = None,
+    expected_artifact: str | None = None,
+    reply_socket: str | None = None,
     pick_latest: bool = False,
     auto_await_new: bool = True,
     activate_gui: bool = False,
@@ -516,7 +519,9 @@ def send_message_to_codex(
             sender=sender or detect_sender(),
             intent=intent,
             user_context=user_context,
+            reply_socket=reply_socket,
             reply_command=build_reply_command(),
+            expected_artifact=expected_artifact,
         )
 
     message, payload_path = spill_enveloped_message(message)
@@ -531,6 +536,8 @@ def send_message_to_codex(
             return False
 
         print(f"[Codex IPC] Message successfully queued to session \"{display_name}\" [{session_id}] (Req-ID: {nonce}).")
+        if expected_artifact:
+            print(f"[Codex IPC] Handshake: Expected artifact registered -> {expected_artifact}", file=sys.stderr)
         return True
     except Exception as e:
         print(f"[Codex IPC] Failed to execute `codex queue`: {e}", file=sys.stderr)
@@ -544,6 +551,7 @@ def send_file(
     wait: bool = False,
     timeout: float = 300.0,
     fast_fail_timeout: float = 15.0,
+    expect_file: str | Path | None = None,
     intent: str = "Read-Only Review",
     user_context: str | None = None,
     pick_latest: bool = False,
@@ -584,8 +592,18 @@ def send_file(
         debug=debug,
     )
     if wait:
-        return send_and_wait(content, timeout=timeout, fast_fail_timeout=fast_fail_timeout, **common_kwargs)
-    return send_message_to_codex(content, **common_kwargs)
+        return send_and_wait(
+            content,
+            timeout=timeout,
+            fast_fail_timeout=fast_fail_timeout,
+            expect_file=expect_file,
+            **common_kwargs
+        )
+    return send_message_to_codex(
+        content,
+        expected_artifact=str(expect_file) if expect_file else None,
+        **common_kwargs
+    )
 
 
 def send_and_wait(
@@ -593,6 +611,7 @@ def send_and_wait(
     target: str | None = None,
     timeout: float = 300.0,
     fast_fail_timeout: float = 15.0,
+    expect_file: str | Path | None = None,
     show_progress: bool = True,
     sender_name: str | None = None,
     intent: str = "Read-Only Review",
@@ -606,10 +625,11 @@ def send_and_wait(
 ) -> tuple[str | None, str | None]:
     """
     Send message to Codex with correlation nonce and wait synchronously.
-    Uses dual-channel listening:
+    Uses multi-channel listening:
       1. Duplex reply channel: ephemeral socket ~/.agent-pair/run/reply-<nonce>.sock (+ mailbox),
          which the peer answers via `agent-pair-ipc reply --to <nonce>` (advertised in the envelope)
-      2. Fallback: incremental TailReader on JSONL rollout transcript with fast-fail detection
+      2. Expected deliverable auto-detection: checks if `expect_file` has been written and stabilized
+      3. Incremental TailReader on JSONL rollout transcript with fast-fail detection
 
     Returns:
         tuple[response_text, verdict]
@@ -627,6 +647,19 @@ def send_and_wait(
 
     cleanup_stale_run_files()
 
+    expect_path: Path | None = None
+    initial_mtime = 0.0
+    initial_size = 0
+    if expect_file:
+        expect_path = Path(expect_file).expanduser().resolve()
+        if expect_path.is_file():
+            try:
+                st = expect_path.stat()
+                initial_mtime = st.st_mtime
+                initial_size = st.st_size
+            except Exception:
+                pass
+
     jsonl_path = session.get("jsonl_path")
     if not jsonl_path or not os.path.exists(jsonl_path):
         jsonl_path = str(find_session_file(session["id"]) or "")
@@ -634,7 +667,10 @@ def send_and_wait(
 
     initial_offset = 0
     if jsonl_path and os.path.exists(jsonl_path):
-        initial_offset = os.path.getsize(jsonl_path)
+        try:
+            initial_offset = os.path.getsize(jsonl_path)
+        except OSError:
+            initial_offset = 0
 
     nonce = generate_nonce()
     reply_server = EphemeralReplyServer(
@@ -657,12 +693,15 @@ def send_and_wait(
         user_context=user_context,
         reply_socket=reply_sock_path,
         reply_command=build_reply_command(),
+        expected_artifact=str(expect_path) if expect_path else (str(expect_file) if expect_file else None),
     )
 
     try:
         ok = send_message_to_codex(
             full_message,
             target=session["id"],
+            expected_artifact=str(expect_path) if expect_path else (str(expect_file) if expect_file else None),
+            reply_socket=reply_sock_path,
             pick_latest=pick_latest,
             auto_await_new=False,
             activate_gui=False,
@@ -687,7 +726,20 @@ def send_and_wait(
                     print(f"[Codex IPC Debug] Response received via duplex channel ({reply_server.channel}).", file=sys.stderr)
                 return r_resp, r_verdict
 
-            # Channel 2: Incremental JSONL transcript reading
+            # Channel 2: Expected deliverable auto-detection
+            if expect_path:
+                ready, art_content, art_verdict = check_artifact_stable(
+                    expect_path,
+                    initial_mtime=initial_mtime,
+                    initial_size=initial_size,
+                    min_stable_seconds=3.0,
+                    require_verdict=True,
+                )
+                if ready and art_content:
+                    print(f"\n[Codex IPC] Detected completed deliverable with verdict [{art_verdict}]: {expect_path} ({len(art_content)} bytes).", file=sys.stderr)
+                    return art_content, art_verdict
+
+            # Channel 3: Incremental JSONL transcript reading
             if not jsonl_path or not os.path.exists(jsonl_path):
                 p = find_session_file(session["id"])
                 if p:
@@ -856,7 +908,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--user-context", default=None, help="User prompt authorization context to pass in peer envelope")
     parser.add_argument("--sender", default=None, help="Sender name in the peer envelope (default: $AGENT_PAIR_SENDER or auto-detected)")
     parser.add_argument("-w", "--wait", action="store_true", help="Send message and synchronously wait for Codex response")
-    parser.add_argument("-t", "--timeout", type=float, default=300.0, help="Wait timeout in seconds (default: 300)")
+    parser.add_argument("-t", "--timeout", "--wait-timeout", dest="timeout", type=float, default=300.0, help="Wait timeout in seconds (default: 300)")
+    parser.add_argument("--expect-file", "--output-file", dest="expect_file", default=None, help="Expected deliverable file path. Auto-detects completion when file settles with verdict.")
     parser.add_argument("--fast-fail", type=float, default=15.0, help="Fast fail timeout in seconds if nonce not consumed (default: 15.0)")
     parser.add_argument("--no-auto-new", action="store_true", help="Disable automatic wait-for-new-thread when no session exists for project")
     parser.add_argument("--debug", action="store_true", help="Enable verbose debug logs")
@@ -922,12 +975,15 @@ def main(argv: list[str] | None = None) -> int:
     if args.msg_flag is not None:
         warn_inline_rich_text(msg_text)
 
-    if args.wait:
+    is_wait = args.wait or bool(args.expect_file)
+
+    if is_wait:
         resp, verdict = send_and_wait(
             msg_text,
             target=target,
             timeout=args.timeout,
             fast_fail_timeout=args.fast_fail,
+            expect_file=args.expect_file,
             intent=args.intent,
             user_context=args.user_context,
             pick_latest=args.pick_latest,
@@ -959,6 +1015,7 @@ def main(argv: list[str] | None = None) -> int:
             target=target,
             intent=args.intent,
             user_context=args.user_context,
+            expected_artifact=args.expect_file,
             pick_latest=args.pick_latest,
             auto_await_new=not args.no_auto_new,
             activate_gui=args.activate_gui,

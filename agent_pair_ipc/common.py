@@ -471,6 +471,83 @@ def _intent_boundary(intent: str, action: str | None = None) -> str:
     return f"遵从声明意图 [{intent}]，未经受邀方评估不执行超越边界操作"
 
 
+def is_pid_alive(pid: int | str | None) -> bool:
+    """Check whether a process with the given PID is currently alive on the system."""
+    if not pid:
+        return False
+    try:
+        ipid = int(pid)
+    except (ValueError, TypeError):
+        return False
+    if ipid <= 0:
+        return False
+    try:
+        os.kill(ipid, 0)
+        return True
+    except OSError as err:
+        import errno
+        return err.errno == errno.EPERM
+
+
+def check_artifact_stable(
+    file_path: str | Path | None,
+    initial_mtime: float = 0.0,
+    initial_size: int = 0,
+    min_stable_seconds: float = 3.0,
+    require_verdict: bool = True,
+) -> tuple[bool, str | None, str | None]:
+    """
+    Check if an expected output artifact file has been created or updated and stabilized.
+    
+    Args:
+        file_path: Path to the expected deliverable.
+        initial_mtime: File mtime before request was dispatched.
+        initial_size: File size before request was dispatched.
+        min_stable_seconds: Seconds mtime must remain unchanged before considering file ready.
+        require_verdict: If True, requires that a standard VERDICT line (SIGN_OFF / CHANGES_REQUESTED)
+                         is present in the file before returning ready. This prevents premature
+                         capture of intermediate working drafts while an agent is still editing.
+                         
+    Returns:
+        tuple[is_ready, content, verdict]
+    """
+    if not file_path:
+        return False, None, None
+    p = Path(file_path).expanduser().resolve()
+    if not p.is_file():
+        return False, None, None
+    try:
+        st = p.stat()
+        if st.st_size == 0:
+            return False, None, None
+
+        if initial_mtime > 0:
+            is_updated = (st.st_mtime > initial_mtime)
+        else:
+            is_updated = (st.st_size > 0)
+
+        if not is_updated:
+            return False, None, None
+
+        # Check stability: mtime has settled for min_stable_seconds
+        now = time.time()
+        if (now - st.st_mtime) < min_stable_seconds:
+            return False, None, None
+
+        content = p.read_text(encoding="utf-8", errors="replace").strip()
+        if not content:
+            return False, None, None
+
+        verdict = extract_verdict(content)
+        if require_verdict and not verdict:
+            # File is updated, but still in-progress (lacks standardized VERDICT line)
+            return False, None, None
+
+        return True, content, verdict
+    except Exception:
+        return False, None, None
+
+
 def format_peer_envelope(
     message: str,
     nonce: str,
@@ -480,11 +557,12 @@ def format_peer_envelope(
     reply_socket: str | None = None,
     action: str | None = None,
     reply_command: str | None = None,
+    expected_artifact: str | None = None,
 ) -> str:
     """
     Format message using the standardized Peer Envelope specification.
     Provides structured request metadata, sender identity, operation boundaries,
-    an honest authorization statement (a peer message is never user approval),
+    expected deliverables, an honest authorization statement,
     and — when `reply_command` is given — instructions for answering over the duplex channel.
     """
     lines = [
@@ -495,6 +573,8 @@ def format_peer_envelope(
         f"- 请求方：{sender} (Local Pair Programming Agent)",
         f"- 操作边界声明：{_intent_boundary(intent, action)}",
     ]
+    if expected_artifact:
+        lines.append(f"- 预期交付产物：{expected_artifact}")
 
     # User authorization context: NEVER fabricate quotes
     if user_context and user_context.strip():
@@ -526,6 +606,7 @@ def attach_request_header(
     intent: str = "Read-Only Review",
     user_context: str | None = None,
     reply_socket: str | None = None,
+    expected_artifact: str | None = None,
 ) -> str:
     """Attach visible correlation nonce and standardized Peer Envelope to outgoing message."""
     return format_peer_envelope(
@@ -535,6 +616,7 @@ def attach_request_header(
         intent=intent,
         user_context=user_context,
         reply_socket=reply_socket,
+        expected_artifact=expected_artifact,
     )
 
 
@@ -552,6 +634,11 @@ def extract_peer_envelope(text: str) -> dict:
     match_intent = re.search(r"-\s*协作类型：\s*([^\n]+)", text)
     if match_intent:
         intent = match_intent.group(1).strip()
+
+    expected_artifact = None
+    match_art = re.search(r"-\s*预期交付产物：\s*([^\n]+)", text)
+    if match_art:
+        expected_artifact = match_art.group(1).strip()
 
     user_context = None
     match_ctx = re.search(r"-\s*用户授权(?:声明|上下文)：\s*(?:User\s*(?:explicit\s*)?prompt:\s*)?\"?([^\n\"]+?)\"?(?:\s*\(.*?\))?$", text, re.MULTILINE)
@@ -575,6 +662,7 @@ def extract_peer_envelope(text: str) -> dict:
         "nonce": nonce,
         "sender": sender,
         "intent": intent,
+        "expected_artifact": expected_artifact,
         "user_context": user_context,
         "reply_socket": reply_socket,
         "body": body,

@@ -317,6 +317,75 @@ class TestCodex(unittest.TestCase):
             self.assertIn("Codex approved directly via callback channel", resp)
             self.assertEqual(verdict, "SIGN_OFF")
 
+    def test_codex_parser_wait_and_expect_file(self):
+        from agent_pair_ipc.codex import build_parser
+
+        parser = build_parser()
+        args1 = parser.parse_args(["-w", "-f", "test.md"])
+        self.assertTrue(args1.wait)
+        self.assertEqual(args1.timeout, 300.0)
+        self.assertIsNone(args1.expect_file)
+
+        args2 = parser.parse_args(["-w", "-t", "120", "--expect-file", "review.md", "-f", "test.md"])
+        self.assertTrue(args2.wait)
+        self.assertEqual(args2.timeout, 120.0)
+        self.assertEqual(args2.expect_file, "review.md")
+
+        args3 = parser.parse_args(["-f", "r.md", "-w", "mock_thread"])
+        self.assertTrue(args3.wait)
+        self.assertEqual(args3.message, "mock_thread")
+        self.assertEqual(args3.timeout, 300.0)
+
+        args3_explicit = parser.parse_args(["-w", "hello", "mock_thread"])
+        self.assertTrue(args3_explicit.wait)
+        self.assertEqual(args3_explicit.message, "hello")
+        self.assertEqual(args3_explicit.target_pos, "mock_thread")
+
+        args4 = parser.parse_args(["--output-file", "out.md", "-f", "test.md"])
+        self.assertEqual(args4.expect_file, "out.md")
+
+    def test_codex_send_and_wait_artifact_auto_detection(self):
+        """Test that Codex send_and_wait returns immediately when expected artifact appears."""
+        import time
+        from agent_pair_ipc.codex import send_and_wait
+
+        with tempfile.NamedTemporaryFile("w+", delete=False, suffix=".md") as art_f, \
+             tempfile.NamedTemporaryFile("w+", delete=False, suffix=".jsonl") as tr_f:
+            art_path = art_f.name
+            tr_path = tr_f.name
+
+        # Backdate the initial empty file so mock delivery update is detected as newer
+        t0 = time.time() - 15.0
+        os.utime(art_path, (t0, t0))
+
+        fake_session = {
+            "id": "codex-artifact-thread-123",
+            "name": "Artifact Test Thread",
+            "cwd": "/fake/cwd",
+            "jsonl_path": tr_path,
+            "mtime": 100.0,
+        }
+
+        def mock_deliver(msg, **kwargs):
+            import time
+            with open(art_path, "w", encoding="utf-8") as f:
+                f.write("# Codex Review\nApproved with flying colors.\n\nVERDICT: SIGN_OFF\n")
+            now = time.time()
+            os.utime(art_path, (now - 5.0, now - 5.0))
+            return True
+
+        try:
+            with patch("agent_pair_ipc.codex.match_session", return_value=(fake_session, "matched")), \
+                 patch("agent_pair_ipc.codex.send_message_to_codex", side_effect=mock_deliver):
+                resp, verdict = send_and_wait("Review request", target="codex-artifact-thread-123", expect_file=art_path, timeout=5.0)
+                self.assertIsNotNone(resp)
+                self.assertIn("Approved with flying colors", resp)
+                self.assertEqual(verdict, "SIGN_OFF")
+        finally:
+            Path(art_path).unlink(missing_ok=True)
+            Path(tr_path).unlink(missing_ok=True)
+
 
 if __name__ == "__main__":
     unittest.main()
+
