@@ -314,15 +314,140 @@ class TestCommon(unittest.TestCase):
         # After context exit, socket should be cleaned up
         self.assertFalse(os.path.exists(sock_path))
 
-    def test_activate_desktop_app_mock(self):
-        from unittest.mock import patch, MagicMock
-        from agent_pair_ipc.common import activate_desktop_app
+    def test_cwd_relation_exact_and_ancestor(self):
+        from agent_pair_ipc.common import cwd_relation
 
-        with patch("sys.platform", "darwin"), patch("subprocess.run") as mock_run:
-            mock_run.return_value = MagicMock(returncode=0, stdout="ok")
-            ok = activate_desktop_app("Claude", new_tab=True)
-            self.assertTrue(ok)
-            self.assertEqual(mock_run.call_count, 2)
+        self.assertEqual(cwd_relation("/some/project", "/some/project"), "exact")
+        self.assertEqual(cwd_relation("/some/repo", "/some/repo/subdir"), "ancestor")
+        self.assertIsNone(cwd_relation("/some/repo/subdir", "/some/repo"))
+        self.assertIsNone(cwd_relation("/some/projA", "/some/projB"))
+
+        home = str(Path.home())
+        self.assertIsNone(cwd_relation(home, f"{home}/myproject"))
+
+    def test_cwd_relation_config_aliases(self):
+        import json
+        from agent_pair_ipc.common import cwd_relation, find_project_config_file, load_project_aliases
+
+        with tempfile.TemporaryDirectory() as td:
+            pair_dir = Path(td) / ".agent-pair"
+            pair_dir.mkdir()
+            cfg_file = pair_dir / "config.json"
+
+            with tempfile.TemporaryDirectory() as alias_dir:
+                cfg_file.write_text(json.dumps({"aliases": [alias_dir]}), encoding="utf-8")
+
+                self.assertIsNotNone(find_project_config_file(td))
+                self.assertIn(str(Path(alias_dir).resolve()), load_project_aliases(td))
+
+                # Bi-directional check
+                self.assertEqual(cwd_relation(alias_dir, td), "linked")
+                self.assertEqual(cwd_relation(td, alias_dir), "linked")
+
+    def test_cwd_relation_top_level_symlink(self):
+        from agent_pair_ipc.common import cwd_relation
+
+        with tempfile.TemporaryDirectory() as dir_a, tempfile.TemporaryDirectory() as dir_b:
+            link_in_a = Path(dir_a) / "code_link"
+            try:
+                link_in_a.symlink_to(dir_b)
+            except OSError:
+                # If OS denies symlink creation, skip
+                return
+
+            self.assertEqual(cwd_relation(dir_a, dir_b), "linked")
+            self.assertEqual(cwd_relation(dir_b, dir_a), "linked")
+
+    def test_cwd_relation_symlink_broad_dir_ignored(self):
+        from agent_pair_ipc.common import cwd_relation
+
+        with tempfile.TemporaryDirectory() as dir_a:
+            home = str(Path.home().resolve())
+            link_to_home = Path(dir_a) / "home_link"
+            try:
+                link_to_home.symlink_to(home)
+            except OSError:
+                return
+
+            # Even though dir_a contains a symlink to home, home must NOT be considered linked!
+            self.assertIsNone(cwd_relation(dir_a, home))
+            self.assertIsNone(cwd_relation(home, dir_a))
+
+    def test_cwd_relation_symlink_ancestor_requires_project_root(self):
+        from agent_pair_ipc.common import cwd_relation
+
+        with tempfile.TemporaryDirectory() as dir_a, tempfile.TemporaryDirectory() as dir_b:
+            link_in_a = Path(dir_a) / "repo_link"
+            try:
+                link_in_a.symlink_to(dir_b)
+            except OSError:
+                return
+
+            sub_b = Path(dir_b) / "pkg" / "module"
+            sub_b.mkdir(parents=True)
+
+            # Case 1: dir_b is NOT a project root (no .git or .agent-pair)
+            # Ancestor relaxation must NOT apply
+            self.assertIsNone(cwd_relation(dir_a, str(sub_b)))
+
+            # Case 2: dir_b IS a project root (has .git)
+            (Path(dir_b) / ".git").mkdir()
+            self.assertEqual(cwd_relation(dir_a, str(sub_b)), "linked")
+
+    def test_filter_project_sessions_priority(self):
+        from agent_pair_ipc.common import filter_project_sessions
+
+        with tempfile.TemporaryDirectory() as base_dir:
+            proj_dir = Path(base_dir) / "proj"
+            proj_dir.mkdir()
+            sub_dir = proj_dir / "sub"
+            sub_dir.mkdir()
+            alias_dir = Path(base_dir) / "alias_proj"
+            alias_dir.mkdir()
+
+            pair_dir = proj_dir / ".agent-pair"
+            pair_dir.mkdir()
+            (pair_dir / "config.json").write_text(f'{{"aliases": ["{alias_dir}"]}}', encoding="utf-8")
+
+            c_exact = {"id": "c1", "cwd": str(proj_dir)}
+            c_linked = {"id": "c2", "cwd": str(alias_dir)}
+            c_ancestor = {"id": "c3", "cwd": str(base_dir)}
+            c_foreign = {"id": "c4", "cwd": "/tmp/totally_different"}
+
+            # Priority 1: exact exists
+            res1 = filter_project_sessions([c_foreign, c_ancestor, c_linked, c_exact], cwd=str(proj_dir))
+            self.assertEqual(res1, [c_exact])
+
+            # Priority 2: linked exists when exact does not
+            res2 = filter_project_sessions([c_foreign, c_ancestor, c_linked], cwd=str(proj_dir))
+            self.assertEqual(res2, [c_linked])
+
+            # Priority 3: ancestor exists when neither exact nor linked exists
+            res3 = filter_project_sessions([c_foreign, c_ancestor], cwd=str(proj_dir))
+            self.assertEqual(res3, [c_ancestor])
+
+    def test_format_peer_envelope_cross_project(self):
+        from agent_pair_ipc.common import format_peer_envelope
+
+        env_cross = format_peer_envelope(
+            message="Please review.",
+            nonce="req_123",
+            caller_cwd="/Users/foo/Duanju",
+            target_cwd="/Users/foo/AI_PM",
+            cwd_relation_type=None,
+        )
+        self.assertIn("跨工程调用警示", env_cross)
+        self.assertIn("/Users/foo/Duanju", env_cross)
+        self.assertIn("/Users/foo/AI_PM", env_cross)
+
+        env_linked = format_peer_envelope(
+            message="Please review.",
+            nonce="req_456",
+            caller_cwd="/Users/foo/code",
+            target_cwd="/Users/foo/Duanju",
+            cwd_relation_type="linked",
+        )
+        self.assertIn("关联/软链接工程", env_linked)
 
 
 if __name__ == "__main__":

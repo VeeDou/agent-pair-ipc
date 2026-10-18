@@ -65,7 +65,9 @@ flowchart TD
 - 🔌 **原生支持主流双引擎**：
   - **Claude Code**：通过 Unix Domain Socket（UDS）进行双向鉴权通信，实时解析会话 JSONL 转储。
   - **OpenAI Codex**：利用原生 `codex queue` 管道投递消息，精准监控 Rollout 事件流中的 `Reasoning`、工具调用与 `task_complete`。
-- 🎯 **安全零配置识别**：自动按当前项目目录（CWD）智能匹配对应的活跃会话，内置自身会话排除机制，杜绝“发给自己”与跨项目盲猜。
+- 🎯 **多工程路由防线与 CWD 亲和性强校验**：基于当前工作目录自动匹配同源会话；强校验 `bindings.json` 与环境变量，失效脏绑定自动告警并回退探测；显式跨工程调用注入高亮 Markdown 警示信封。
+- 🔗 **多工程别名与软链接感知**：支持在 `.agent-pair/config.json` 中配置 `"aliases": [...]` 别名工作区；支持单层顶层软链接感知与严格的工程根边界保护（非真实项目根禁止祖先路径放宽，杜绝误匹配 `$HOME` 等根目录）。
+- 🛡️ **路径参数防呆与名称去歧义**：拦截误传给 `-s` 的文件路径并给出指引，同时放行包含斜杠的合法会话标题（如 `"UI/UX 评审"`）；名称子串多重匹配严格拒绝猜选。
 - 📁 **文件化 Payload 管道（`-f` / `-f -`）**：文件或带引号 heredoc 经 stdin 传递，反引号与 `$(...)` 原样保留；Codex 超长正文自动落盘为 0600 文件，不再塞进 argv。
 - ↩️ **双向回调通道**：每个请求都带回信地址，对方用 `agent-pair-ipc reply --to <Req-ID>` 经临时 0600 Socket 直接回传（支持进度帧与 ACK）；请求方离线时进入收件箱（`agent-pair-ipc inbox`），转录追踪保留为兜底。详见 [docs/duplex_reply_protocol.md](docs/duplex_reply_protocol.md)。
 - 🖥️ **GUI 原生拉起，IPC 随后挂载**：无会话时 `--await-new-session -g` 通过桌面端自带的 New Session 新建**可见**会话并自动绑定，不再生成隐形孤儿进程。

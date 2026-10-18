@@ -229,43 +229,94 @@ def match_session(
 
     if resolved_target:
         target_str = str(resolved_target).strip()
+
+        matched = None
         # 1. Exact match on host_session_id
         for c in candidates:
             if c["host_session_id"] == target_str:
-                return c, "matched"
+                matched = c
+                break
         # 2. Exact match on session_id
-        for c in candidates:
-            if c["session_id"] == target_str:
-                return c, "matched"
+        if not matched:
+            for c in candidates:
+                if c["session_id"] == target_str:
+                    matched = c
+                    break
         # 3. Exact match on PID
-        for c in candidates:
-            if str(c["pid"]) == target_str:
-                return c, "matched"
-        # 4. Exact match on name
-        for c in candidates:
-            if c["name"] == target_str:
-                return c, "matched"
+        if not matched:
+            for c in candidates:
+                if str(c["pid"]) == target_str:
+                    matched = c
+                    break
+        # 4. Exact match on name (supports titles containing slashes like "UI/UX 评审" or "A/B 测试")
+        if not matched:
+            for c in candidates:
+                if c["name"] == target_str:
+                    matched = c
+                    break
+
+        # R3 Path Parameter Guard: only intercept if no exact match and value looks like a filesystem path
+        if not matched and source_kind == "cli_flag":
+            is_path_like = (
+                target_str.startswith(("/", "~", "./", "../"))
+                or os.path.isdir(os.path.expanduser(target_str))
+            )
+            if is_path_like:
+                print(f"\n[Claude Code IPC] Error: Target session '{target_str}' looks like a filesystem path.", file=sys.stderr)
+                print("👉 `-s / --session` requires a session ID, hostSessionId, PID, or session title.", file=sys.stderr)
+                print("   To target a project directory, `cd` into that directory or configure project aliases in `.agent-pair/config.json`.\n", file=sys.stderr)
+                return None, "invalid_target"
+
         # 5. Prefix match on host_session_id (>= 6 chars)
-        if len(target_str) >= 6:
+        if not matched and len(target_str) >= 6:
             for c in candidates:
                 if c["host_session_id"].startswith(target_str):
-                    return c, "matched"
+                    matched = c
+                    break
         # 6. Prefix match on session_id (>= 6 chars)
-        if len(target_str) >= 6:
+        if not matched and len(target_str) >= 6:
             for c in candidates:
                 if c["session_id"].startswith(target_str):
-                    return c, "matched"
-        # 7. Substring match on name (case-insensitive)
-        for c in candidates:
-            if target_str.lower() in c["name"].lower():
-                return c, "matched"
+                    matched = c
+                    break
+        # 7. Substring match on name (case-insensitive) - with disambiguation
+        if not matched:
+            name_matches = [c for c in candidates if target_str.lower() in c["name"].lower()]
+            if len(name_matches) == 1:
+                matched = name_matches[0]
+            elif len(name_matches) > 1:
+                print(f"\n[Claude Code IPC] Error: Ambiguous target '{target_str}'! Matches multiple session names:", file=sys.stderr)
+                for m in name_matches:
+                    print(f"  • [{m.get('host_session_id') or m.get('session_id')}] \"{m.get('name')}\" (PID: {m.get('pid')})", file=sys.stderr)
+                print("Please specify an exact session ID or PID with `-s`.\n", file=sys.stderr)
+                return None, "ambiguous"
 
-        if source_kind == "bindings_file":
-            print(f"\n[Claude Code IPC] Error: Bound session '{target_str}' in .agent-pair/bindings.json was not found.", file=sys.stderr)
-            print("👉 The bound session may have ended or been closed.", file=sys.stderr)
-            print("   Run with `-s <session_id>` to target another session, or run with `--unbind`.\n", file=sys.stderr)
+        if matched:
+            current_cwd = os.getcwd()
+            relation = cwd_relation(matched.get("cwd"), current_cwd)
+            # R2: CWD Affinity Check on bindings_file and env_var
+            if source_kind in ("bindings_file", "env_var"):
+                if relation is None:
+                    src_label = ".agent-pair/bindings.json" if source_kind == "bindings_file" else "environment variable AGENT_PAIR_CLAUDE_SESSION"
+                    print(f"\n[Claude Code IPC] ⚠️ Warning: 忽略 {src_label} 中的失效绑定！", file=sys.stderr)
+                    print(f"   绑定的会话 [{target_str}] 运行在 '{matched.get('cwd')}'，与当前工程 '{current_cwd}' 无关。", file=sys.stderr)
+                    print("   👉 自动回退到当前工程会话探测逻辑。可运行 `agent-pair-ipc claude --unbind` 清理。\n", file=sys.stderr)
+                    # Clear resolved_target so execution falls through to allow_cwd_fallback
+                    resolved_target = None
+                else:
+                    return matched, "matched"
+            else:
+                # source_kind == "cli_flag"
+                if relation is None:
+                    print(f"[Claude Code IPC] ⚠️ NOTICE: 跨工程调用警示！目标会话运行在 '{matched.get('cwd')}'，与当前目录 '{current_cwd}' 不一致！", file=sys.stderr)
+                return matched, "matched"
 
-        return None, "none"
+        if resolved_target:
+            if source_kind == "bindings_file":
+                print(f"\n[Claude Code IPC] Error: Bound session '{target_str}' in .agent-pair/bindings.json was not found.", file=sys.stderr)
+                print("👉 The bound session may have ended or been closed.", file=sys.stderr)
+                print("   Run with `-s <session_id>` to target another session, or run with `--unbind`.\n", file=sys.stderr)
+            return None, "none"
 
     if not allow_cwd_fallback:
         return None, "none"
@@ -402,7 +453,7 @@ def _resolve_or_await_session(
     """Shared session resolution for send / send-and-wait. Raises NeedsNewSessionError in non-TTY."""
     candidates = get_active_sessions(exclude_self=True, debug=debug)
     session, status = match_session(target=target, candidates=candidates, pick_latest=pick_latest, debug=debug) if candidates else (None, "none")
-    if session or status == "ambiguous":
+    if session or status in ("ambiguous", "invalid_target"):
         return session, status
     resolved_target, _ = resolve_target_session(target)
     if resolved_target is None and auto_await_new:
@@ -433,12 +484,15 @@ def send_message_to_claude(
     """
     session, status = _resolve_or_await_session(target, pick_latest, auto_await_new, activate_gui, await_timeout, debug)
     if not session:
-        if status != "ambiguous":
+        if status not in ("ambiguous", "invalid_target"):
             _report_missing_session(target)
         return False
 
     sock_path = session["socket_path"]
     token = session["token"]
+
+    current_cwd = os.getcwd()
+    rel = cwd_relation(session.get("cwd"), current_cwd)
 
     # Wrap in Peer Envelope if not already wrapped
     nonce = extract_nonce(message)
@@ -453,6 +507,9 @@ def send_message_to_claude(
             reply_socket=reply_socket,
             reply_command=build_reply_command(),
             expected_artifact=expected_artifact,
+            caller_cwd=current_cwd,
+            target_cwd=session.get("cwd"),
+            cwd_relation_type=rel,
         )
 
     # Standardized Handshake Metadata
@@ -462,6 +519,12 @@ def send_message_to_claude(
         "request_id": nonce,
         "caller": caller_name,
     }
+    if rel is None and session.get("cwd"):
+        metadata["cross_project"] = "true"
+        metadata["caller_cwd"] = current_cwd
+        metadata["target_cwd"] = str(session.get("cwd"))
+    if rel == "linked" and session.get("cwd"):
+        metadata["project_relation"] = "linked"
     if expected_artifact:
         metadata["expected_artifact"] = str(expected_artifact)
     if reply_socket:
@@ -616,7 +679,7 @@ def read_latest_feedback(target: str | None = None, n: int = 1, only_final: bool
     candidates = get_active_sessions(exclude_self=False)
     session, status = match_session(target=target, candidates=candidates, pick_latest=pick_latest) if candidates else (None, "none")
     if not session:
-        if status != "ambiguous":
+        if status not in ("ambiguous", "invalid_target"):
             print(f"[Claude Code IPC] No matching session found for target '{target}'.", file=sys.stderr)
         return []
 
@@ -664,7 +727,7 @@ def send_and_wait(
         return None, "NEEDS_NEW_THREAD"
 
     if not session:
-        if status != "ambiguous":
+        if status not in ("ambiguous", "invalid_target"):
             _report_missing_session(target)
         return None, None
 
@@ -705,6 +768,9 @@ def send_and_wait(
         if debug:
             print(f"[Claude Code IPC Debug] Could not start ephemeral reply server (mailbox still active): {e}", file=sys.stderr)
 
+    current_cwd = os.getcwd()
+    rel = cwd_relation(session.get("cwd"), current_cwd)
+
     full_message = format_peer_envelope(
         message=message,
         nonce=nonce,
@@ -714,6 +780,9 @@ def send_and_wait(
         reply_socket=reply_sock_path,
         reply_command=build_reply_command(),
         expected_artifact=str(expect_path) if expect_path else (str(expect_file) if expect_file else None),
+        caller_cwd=current_cwd,
+        target_cwd=session.get("cwd"),
+        cwd_relation_type=rel,
     )
 
     try:
@@ -893,7 +962,7 @@ def list_sessions(candidates: list[dict] | None = None, debug: bool = False):
         kind_entry = f"{c['kind']} ({c['entrypoint']})" if c['entrypoint'] else c['kind']
         is_self = " (Current Session)" if str(c["pid"]) == str(self_ids["pid"]) else ""
         relation = cwd_relation(c.get("cwd"), current_cwd)
-        is_cwd = " [Current Project]" if relation == "exact" else (" [Parent of CWD]" if relation == "ancestor" else "")
+        is_cwd = " [Current Project]" if relation == "exact" else (" [Linked Project]" if relation == "linked" else (" [Parent of CWD]" if relation == "ancestor" else ""))
         status = c.get("status") or "-"
         print(f"{c['pid']:<7} {kind_entry:<30} {status:<7} {hid:<40} {c['name']}{is_self}{is_cwd}")
         print(f"        └─ Socket:     {c['socket_path']}")

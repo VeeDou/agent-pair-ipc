@@ -4,7 +4,7 @@ agent-pair-ipc: Zero-dependency Local IPC & Pair-Review Toolkit for AI Coding Ag
 
 from __future__ import annotations
 
-__version__ = "0.4.0"
+__version__ = "0.5.0"
 
 from agent_pair_ipc.claude import (
     get_active_sessions as get_active_claude_sessions,

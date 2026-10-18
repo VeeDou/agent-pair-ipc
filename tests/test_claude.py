@@ -496,6 +496,119 @@ class TestClaude(unittest.TestCase):
             Path(tr_path).unlink(missing_ok=True)
 
 
+    def test_claude_match_session_path_parameter_guard(self):
+        from agent_pair_ipc.claude import match_session
+
+        fake_session = {
+            "pid": 111,
+            "session_id": "sess-path-guard",
+            "host_session_id": "host-path-guard",
+            "name": "Path Guard Session",
+            "cwd": "/Users/liuvictory/projects/AI_PM",
+            "socket_path": "/fake/sock",
+            "token": "tok123",
+            "mtime": 100.0,
+        }
+
+        # Case 1: Target starts with /
+        sess, status = match_session(target="/Users/liuvictory/projects/AI_PM", candidates=[fake_session])
+        self.assertIsNone(sess)
+        self.assertEqual(status, "invalid_target")
+
+        # Case 2: Target starts with ~
+        sess2, status2 = match_session(target="~/projects/AI_PM", candidates=[fake_session])
+        self.assertIsNone(sess2)
+        self.assertEqual(status2, "invalid_target")
+
+    def test_claude_match_session_title_with_slash_allowed(self):
+        from agent_pair_ipc.claude import match_session
+
+        slash_session = {
+            "pid": 112,
+            "session_id": "sess-slash-title",
+            "host_session_id": "host-slash-title",
+            "name": "UI/UX 评审",
+            "cwd": "/Users/liuvictory/projects/AI_PM",
+            "socket_path": "/fake/sock",
+            "token": "tok123",
+            "mtime": 100.0,
+        }
+
+        # Exact title with slash must NOT be rejected by path guard
+        sess, status = match_session(target="UI/UX 评审", candidates=[slash_session])
+        self.assertIsNotNone(sess)
+        self.assertEqual(sess["name"], "UI/UX 评审")
+        self.assertEqual(status, "matched")
+
+    def test_claude_match_session_name_disambiguation(self):
+        from agent_pair_ipc.claude import match_session
+
+        sess1 = {
+            "pid": 101,
+            "session_id": "sess-alpha-1",
+            "host_session_id": "host-alpha-1",
+            "name": "Clash Verge Task A",
+            "cwd": "/some/cwd",
+            "socket_path": "/fake/sock1",
+            "token": "tok1",
+            "mtime": 100.0,
+        }
+        sess2 = {
+            "pid": 102,
+            "session_id": "sess-alpha-2",
+            "host_session_id": "host-alpha-2",
+            "name": "Clash Verge Task B",
+            "cwd": "/some/cwd",
+            "socket_path": "/fake/sock2",
+            "token": "tok2",
+            "mtime": 105.0,
+        }
+
+        # Query "Clash Verge" matches both sess1 and sess2: must be ambiguous!
+        sess, status = match_session(target="Clash Verge", candidates=[sess1, sess2])
+        self.assertIsNone(sess)
+        self.assertEqual(status, "ambiguous")
+
+    def test_claude_match_session_dirty_binding_fallback(self):
+        import os
+        from unittest.mock import patch
+        from agent_pair_ipc.claude import match_session
+
+        curr_dir = os.getcwd()
+        foreign_dir = "/tmp/foreign_unrelated_dir"
+
+        # Bound session runs in foreign_dir (dirty binding)
+        sess_dirty = {
+            "pid": 201,
+            "session_id": "dirty-bound-session",
+            "host_session_id": "dirty-bound-host",
+            "name": "Dirty Binding Session",
+            "cwd": foreign_dir,
+            "socket_path": "/fake/sock_dirty",
+            "token": "tok_dirty",
+            "mtime": 100.0,
+        }
+        # Legitimate session running in current CWD
+        sess_current = {
+            "pid": 202,
+            "session_id": "current-session",
+            "host_session_id": "current-host",
+            "name": "Current Project Session",
+            "cwd": curr_dir,
+            "socket_path": "/fake/sock_curr",
+            "token": "tok_curr",
+            "mtime": 110.0,
+        }
+
+        # Simulate bindings.json having "dirty-bound-session"
+        with patch("agent_pair_ipc.claude.resolve_target_session", return_value=("dirty-bound-session", "bindings_file")):
+            sess, status = match_session(target=None, candidates=[sess_dirty, sess_current])
+            # The dirty binding must be IGNORED and fallback must pick sess_current!
+            self.assertIsNotNone(sess)
+            self.assertEqual(sess["session_id"], "current-session")
+            self.assertEqual(status, "matched")
+
+
 if __name__ == "__main__":
     unittest.main()
 

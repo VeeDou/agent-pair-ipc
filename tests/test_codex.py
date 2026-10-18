@@ -386,6 +386,97 @@ class TestCodex(unittest.TestCase):
             Path(tr_path).unlink(missing_ok=True)
 
 
+    def test_codex_match_session_path_parameter_guard(self):
+        from agent_pair_ipc.codex import match_session
+
+        fake_session = {
+            "id": "thread-path-guard",
+            "name": "Path Guard Thread",
+            "cwd": "/Users/liuvictory/projects/AI_PM",
+            "jsonl_path": "/fake/tr.jsonl",
+            "mtime": 100.0,
+        }
+
+        # Case 1: Target starts with /
+        sess, status = match_session(target="/Users/liuvictory/projects/AI_PM", candidates=[fake_session])
+        self.assertIsNone(sess)
+        self.assertEqual(status, "invalid_target")
+
+        # Case 2: Target starts with ~
+        sess2, status2 = match_session(target="~/projects/AI_PM", candidates=[fake_session])
+        self.assertIsNone(sess2)
+        self.assertEqual(status2, "invalid_target")
+
+    def test_codex_match_session_title_with_slash_allowed(self):
+        from agent_pair_ipc.codex import match_session
+
+        slash_session = {
+            "id": "thread-slash-title",
+            "name": "UI/UX 评审",
+            "cwd": "/Users/liuvictory/projects/AI_PM",
+            "jsonl_path": "/fake/tr.jsonl",
+            "mtime": 100.0,
+        }
+
+        # Exact title with slash must NOT be rejected by path guard
+        sess, status = match_session(target="UI/UX 评审", candidates=[slash_session])
+        self.assertIsNotNone(sess)
+        self.assertEqual(sess["name"], "UI/UX 评审")
+        self.assertEqual(status, "matched")
+
+    def test_codex_match_session_name_disambiguation(self):
+        from agent_pair_ipc.codex import match_session
+
+        sess1 = {
+            "id": "thread-101",
+            "name": "Clash Verge Task A",
+            "cwd": "/some/cwd",
+            "jsonl_path": "/fake/tr1.jsonl",
+            "mtime": 100.0,
+        }
+        sess2 = {
+            "id": "thread-102",
+            "name": "Clash Verge Task B",
+            "cwd": "/some/cwd",
+            "jsonl_path": "/fake/tr2.jsonl",
+            "mtime": 105.0,
+        }
+
+        # Query "Clash Verge" matches both sess1 and sess2: must be ambiguous!
+        sess, status = match_session(target="Clash Verge", candidates=[sess1, sess2])
+        self.assertIsNone(sess)
+        self.assertEqual(status, "ambiguous")
+
+    def test_codex_match_session_dirty_binding_fallback(self):
+        import os
+        from unittest.mock import patch
+        from agent_pair_ipc.codex import match_session
+
+        curr_dir = os.getcwd()
+        foreign_dir = "/tmp/foreign_unrelated_dir"
+
+        sess_dirty = {
+            "id": "dirty-bound-thread",
+            "name": "Dirty Binding Thread",
+            "cwd": foreign_dir,
+            "jsonl_path": "/fake/tr_dirty.jsonl",
+            "mtime": 100.0,
+        }
+        sess_current = {
+            "id": "current-thread",
+            "name": "Current Project Thread",
+            "cwd": curr_dir,
+            "jsonl_path": "/fake/tr_curr.jsonl",
+            "mtime": 110.0,
+        }
+
+        with patch("agent_pair_ipc.codex.resolve_target_session", return_value=("dirty-bound-thread", "bindings_file")):
+            sess, status = match_session(target=None, candidates=[sess_dirty, sess_current])
+            self.assertIsNotNone(sess)
+            self.assertEqual(sess["id"], "current-thread")
+            self.assertEqual(status, "matched")
+
+
 if __name__ == "__main__":
     unittest.main()
 

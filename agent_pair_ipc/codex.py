@@ -200,31 +200,77 @@ def match_session(
 
     if resolved_target:
         target_str = str(resolved_target).strip()
+
+        matched = None
         for c in candidates:
             if c["id"] == target_str:
-                return enrich_session_info(c), "matched"
-        for c in candidates:
-            if c["name"] == target_str:
-                return enrich_session_info(c), "matched"
-        if len(target_str) >= 6:
+                matched = enrich_session_info(c)
+                break
+        if not matched:
+            for c in candidates:
+                if c["name"] == target_str:
+                    matched = enrich_session_info(c)
+                    break
+
+        # R3 Path Parameter Guard: only intercept if no exact match and value looks like a filesystem path
+        if not matched and source_kind == "cli_flag":
+            is_path_like = (
+                target_str.startswith(("/", "~", "./", "../"))
+                or os.path.isdir(os.path.expanduser(target_str))
+            )
+            if is_path_like:
+                print(f"\n[Codex IPC] Error: Target session '{target_str}' looks like a filesystem path.", file=sys.stderr)
+                print("👉 `-s / --session` requires a thread ID, title, or rollout ID.", file=sys.stderr)
+                print("   To target a project directory, `cd` into that directory or configure project aliases in `.agent-pair/config.json`.\n", file=sys.stderr)
+                return None, "invalid_target"
+        if not matched and len(target_str) >= 6:
             for c in candidates:
                 if c["id"].startswith(target_str):
-                    return enrich_session_info(c), "matched"
-        for c in candidates:
-            if target_str.lower() in c["name"].lower():
-                return enrich_session_info(c), "matched"
-        if len(target_str) >= 8:
+                    matched = enrich_session_info(c)
+                    break
+        if not matched:
+            name_matches = [c for c in candidates if target_str.lower() in c["name"].lower()]
+            if len(name_matches) == 1:
+                matched = enrich_session_info(name_matches[0])
+            elif len(name_matches) > 1:
+                print(f"\n[Codex IPC] Error: Ambiguous target '{target_str}'! Matches multiple thread names:", file=sys.stderr)
+                for m in name_matches:
+                    print(f"  • [{m.get('id')}] \"{m.get('name')}\"", file=sys.stderr)
+                print("Please specify an exact thread ID with `-s`.\n", file=sys.stderr)
+                return None, "ambiguous"
+
+        if not matched and len(target_str) >= 8:
             direct_file = find_session_file(target_str)
             if direct_file:
                 c = {"id": target_str, "name": target_str, "updated_at": "", "jsonl_path": str(direct_file), "cwd": None}
-                return enrich_session_info(c), "matched"
+                matched = enrich_session_info(c)
 
-        if source_kind == "bindings_file":
-            print(f"\n[Codex IPC] Error: Bound session '{target_str}' in .agent-pair/bindings.json was not found.", file=sys.stderr)
-            print("👉 The bound session may have been deleted or archived.", file=sys.stderr)
-            print("   Run with `-s <session_id>` to target another session, or run with `--unbind`.\n", file=sys.stderr)
+        if matched:
+            current_cwd = os.getcwd()
+            relation = cwd_relation(matched.get("cwd"), current_cwd)
+            # R2: CWD Affinity Check on bindings_file and env_var
+            if source_kind in ("bindings_file", "env_var"):
+                if relation is None:
+                    src_label = ".agent-pair/bindings.json" if source_kind == "bindings_file" else "environment variable AGENT_PAIR_CODEX_THREAD"
+                    print(f"\n[Codex IPC] ⚠️ Warning: 忽略 {src_label} 中的失效绑定！", file=sys.stderr)
+                    print(f"   绑定的会话 [{target_str}] 运行在 '{matched.get('cwd')}'，与当前工程 '{current_cwd}' 无关。", file=sys.stderr)
+                    print("   👉 自动回退到当前工程会话探测逻辑。可运行 `agent-pair-ipc codex --unbind` 清理。\n", file=sys.stderr)
+                    # Clear resolved_target so execution falls through to allow_cwd_fallback
+                    resolved_target = None
+                else:
+                    return matched, "matched"
+            else:
+                # source_kind == "cli_flag"
+                if relation is None:
+                    print(f"[Codex IPC] ⚠️ NOTICE: 跨工程调用警示！目标会话运行在 '{matched.get('cwd')}'，与当前目录 '{current_cwd}' 不一致！", file=sys.stderr)
+                return matched, "matched"
 
-        return None, "none"
+        if resolved_target:
+            if source_kind == "bindings_file":
+                print(f"\n[Codex IPC] Error: Bound session '{target_str}' in .agent-pair/bindings.json was not found.", file=sys.stderr)
+                print("👉 The bound session may have been deleted or archived.", file=sys.stderr)
+                print("   Run with `-s <session_id>` to target another session, or run with `--unbind`.\n", file=sys.stderr)
+            return None, "none"
 
     if not allow_cwd_fallback:
         return None, "none"
@@ -347,7 +393,8 @@ def await_new_thread(
                         continue
                     if meta.get("source") == "exec":
                         continue
-                    if cwd_relation(meta.get("cwd"), target_cwd) is None:
+                    rel = cwd_relation(meta.get("cwd"), target_cwd)
+                    if rel is None:
                         if sid not in reported_foreign:
                             reported_foreign.add(sid)
                             if tty:
@@ -358,7 +405,8 @@ def await_new_thread(
                     save_project_binding("codex", sid, cwd=target_cwd)
                     if tty:
                         print("", file=sys.stderr)
-                    print(f"[Codex IPC] 监听到新会话诞生: [{sid}] -> 自动完成持久绑定！", file=sys.stderr)
+                    rel_tag = f" ({rel})" if rel != "exact" else ""
+                    print(f"[Codex IPC] 监听到新会话诞生: [{sid}]{rel_tag} -> 自动完成持久绑定！", file=sys.stderr)
                     return {
                         "id": sid,
                         "name": "New Thread",
@@ -441,7 +489,7 @@ def read_latest_feedback(target: str | None = None, n: int = 1, only_final: bool
     """Fetch the latest assistant turns from target session."""
     session, status = match_session(target=target, pick_latest=pick_latest)
     if not session:
-        if status != "ambiguous":
+        if status not in ("ambiguous", "invalid_target"):
             print(f"[Codex IPC] No matching session found for target '{target}'.", file=sys.stderr)
         return []
 
@@ -471,7 +519,7 @@ def _resolve_or_await_session(
 ) -> tuple[dict | None, str]:
     """Shared session resolution for send / send-and-wait. Raises NeedsNewSessionError in non-TTY."""
     session, status = match_session(target=target, pick_latest=pick_latest, debug=debug)
-    if session or status == "ambiguous":
+    if session or status in ("ambiguous", "invalid_target"):
         return session, status
     resolved_target, _ = resolve_target_session(target)
     if resolved_target is None and auto_await_new:
@@ -502,12 +550,15 @@ def send_message_to_codex(
     """
     session, status = _resolve_or_await_session(target, pick_latest, auto_await_new, activate_gui, await_timeout, debug)
     if not session:
-        if status != "ambiguous":
+        if status not in ("ambiguous", "invalid_target"):
             _report_missing_session(target)
         return False
 
     session_id = session["id"]
     display_name = session.get("name") or session_id
+
+    current_cwd = os.getcwd()
+    rel = cwd_relation(session.get("cwd"), current_cwd)
 
     # Wrap in Peer Envelope if not already wrapped
     nonce = extract_nonce(message)
@@ -522,6 +573,9 @@ def send_message_to_codex(
             reply_socket=reply_socket,
             reply_command=build_reply_command(),
             expected_artifact=expected_artifact,
+            caller_cwd=current_cwd,
+            target_cwd=session.get("cwd"),
+            cwd_relation_type=rel,
         )
 
     message, payload_path = spill_enveloped_message(message)
@@ -641,7 +695,7 @@ def send_and_wait(
         return None, "NEEDS_NEW_THREAD"
 
     if not session:
-        if status != "ambiguous":
+        if status not in ("ambiguous", "invalid_target"):
             _report_missing_session(target)
         return None, None
 
@@ -685,6 +739,9 @@ def send_and_wait(
         if debug:
             print(f"[Codex IPC Debug] Could not start ephemeral reply server (mailbox still active): {e}", file=sys.stderr)
 
+    current_cwd = os.getcwd()
+    rel = cwd_relation(session.get("cwd"), current_cwd)
+
     full_message = format_peer_envelope(
         message=message,
         nonce=nonce,
@@ -694,6 +751,9 @@ def send_and_wait(
         reply_socket=reply_sock_path,
         reply_command=build_reply_command(),
         expected_artifact=str(expect_path) if expect_path else (str(expect_file) if expect_file else None),
+        caller_cwd=current_cwd,
+        target_cwd=session.get("cwd"),
+        cwd_relation_type=rel,
     )
 
     try:
@@ -839,6 +899,8 @@ def list_sessions(debug: bool = False):
         relation = cwd_relation(s.get("cwd"), current_cwd)
         if relation == "exact":
             tags.append("Current Project")
+        elif relation == "linked":
+            tags.append("Linked Project")
         elif relation == "ancestor":
             tags.append("Parent of CWD")
         if bound_id and (s["id"] == bound_id or s["id"].startswith(bound_id)):

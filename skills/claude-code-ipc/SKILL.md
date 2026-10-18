@@ -91,10 +91,27 @@ agent-pair-ipc inbox                    # 列出收件箱
 agent-pair-ipc inbox req_0123456789ab   # 读取并按 VERDICT 返回退出码
 ```
 
-### 场景 F：查看当前所有活跃的 Claude Code 会话（含 idle / busy 状态）
+### 场景 F：查看当前所有活跃的 Claude Code 会话（含 idle / busy / 关联关系）
 ```bash
 agent-pair-ipc claude -l
+# 标签说明：
+# [Current Project] -> 同一物理工作区
+# [Linked Project]  -> 通过 config.json 别名或顶层软链接关联的工作区
+# [Parent of CWD]   -> 上层父目录工作区
 ```
+
+### 场景 G：多工程工作区与别名配置（解决物理路径与桌面端 Project 割裂）
+当开发代码库物理路径与 Claude Desktop 项目目录不一致（例如桌面端项目名为 `Duanju`，而实际源码在单独仓库目录中）：
+1. **配置文件声明（最推荐）**：在工程根目录的 `.agent-pair/config.json` 中配置别名列表：
+   ```json
+   {
+     "aliases": [
+       "/Users/liuvictory/Duanju"
+     ]
+   }
+   ```
+2. **符号链接探测**：若工程顶层存在指向桌面端项目的软链接（或反向包含软链接），工具会自动探测并识别为 `[Linked Project]`。
+优先级严格遵循：`exact > linked > ancestor`。同级若出现多个候选，坚决触发“歧义即拒绝”，绝不盲目随机挑选。
 
 ---
 
@@ -127,6 +144,10 @@ agent-pair-ipc claude -l
    - **禁止**以非阻塞方式（不带 `-w`）发送后直接对用户回复“已提交复核，静候答复”并结束回合，避免发生长达数小时的协作死寂。
    - 可加 `--user-context "<用户原话>"` 如实声明用户授权上下文（不得编造）。
 4. **获取复核结论**：脚本返回 Exit 0/2 并输出 `=== [Claude Code Response] ===` 后，提炼结论向用户汇报，**并停下来等待用户裁决**。若遇到未消费超时或会话挂起（Exit 4），使用 `agent-pair-ipc inbox <Req-ID>` 取件或切换前台唤醒会话重新等待。
+5. **防跨工程串线安全准则**：
+   - **禁止向 `-s / --session` 传递文件系统路径**（如传入含 `/` 或以 `~` 开头的路径直接报错退出并提示正确用法）。
+   - **脏绑定自动忽略保护**：若 `bindings.json` 中的历史会话与当前 CWD 无亲和性，工具会自动警告并忽略该失效绑定，安全回退到当前工程自动探测。
+   - **信封透明度**：显式跨工程调用会在对等信封头部注入醒目的 `⚠️ 跨工程调用警示！`，告知接收方相对路径差异，避免报告“找不到代码”。
 
 ---
 

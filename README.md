@@ -62,7 +62,9 @@ Most multi-agent frameworks spawn ephemeral, cold-started API instances that hav
 - 🔌 **Dual Engine Support**:
   - **Claude Code**: Interacts directly with CLI / Desktop sessions via Unix Domain Sockets (`AF_UNIX`) and tracks project JSONL transcripts.
   - **OpenAI Codex**: Injects messages via native `codex queue` and monitors rollout event streams (`Reasoning`, `custom_tool_call`, `task_complete`).
-- 🎯 **Safe Zero-Config Workspace Detection**: Automatically identifies the active session matching the current project working directory (`cwd`) while strictly preventing self-message loops.
+- 🎯 **Safe Multi-Project Routing & CWD Affinity**: Automatically identifies active sessions matching current project working directory (`cwd`) with strict dirty-binding invalidation and fallback. Explicit cross-project calls inject visible markdown context warnings into peer envelopes.
+- 🔗 **Project Aliases & Symlink Awareness**: Supports multi-directory worktrees via `.agent-pair/config.json` (`"aliases": [...]`) and top-level directory symlinks with strict safety boundaries (ancestor relaxation restricted to verified `.git` / `.agent-pair` roots).
+- 🛡️ **Path Guard & Ambiguity Defense**: Blocks accidental filesystem paths in `-s` with user-friendly diagnostics while allowing title names containing slashes (e.g. `"UI/UX 评审"`). Refuses to guess on ambiguous session names.
 - 📁 **File-Based Payload Pipeline (`-f`, `-f -`)**: Files or quoted heredocs via stdin. Backticks and `$(...)` survive verbatim, and oversized Codex payloads are moved to 0600 files instead of argv.
 - ↩️ **Duplex Reply Channel**: Every request carries a return address. The peer answers with `agent-pair-ipc reply --to <Req-ID>` over an ephemeral 0600 socket (with progress frames and acks). Late answers land in a mailbox (`agent-pair-ipc inbox`), and transcript tailing remains the fallback. See [docs/duplex_reply_protocol.md](docs/duplex_reply_protocol.md).
 - 🖥️ **GUI-Native Session Pairing**: Without a session, `--await-new-session -g` opens a *visible* session through the desktop app's own New Session action, then auto-binds it. No invisible orphan processes.

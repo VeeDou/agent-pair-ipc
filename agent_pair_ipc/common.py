@@ -283,10 +283,113 @@ def normalize_path(path: str | None) -> str:
         return path
 
 
+def find_project_config_file(cwd: str | None = None) -> Path | None:
+    """
+    Find .agent-pair/config.json starting from cwd walking up parents.
+    Stops traversing past repository root (.git), .agent-pair, or user home directory ($HOME).
+    """
+    cur = Path(cwd or os.getcwd()).resolve()
+    home = Path.home().resolve()
+    for p in [cur] + list(cur.parents):
+        cfg = p / ".agent-pair" / "config.json"
+        if cfg.is_file():
+            return cfg
+        if (p / ".agent-pair").is_dir() or (p / ".git").exists() or p == home or p == p.parent:
+            break
+    return None
+
+
+def load_project_aliases(cwd: str | None = None) -> list[str]:
+    """Load normalized project aliases declared in .agent-pair/config.json."""
+    cfg = find_project_config_file(cwd)
+    if not cfg:
+        return []
+    try:
+        with open(cfg, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            aliases = data.get("aliases", [])
+            res = []
+            for a in aliases:
+                if isinstance(a, str) and a.strip():
+                    norm = normalize_path(a.strip())
+                    if norm and norm not in res:
+                        res.append(norm)
+            return res
+    except Exception:
+        return []
+
+
+def _is_broad_directory(path: str) -> bool:
+    """Check if path is too broad (home, root, Volumes, /Users) to be considered a project root."""
+    if not path:
+        return True
+    norm = normalize_path(path)
+    home_str = normalize_path(str(Path.home()))
+    # Equal to HOME, /, or an ancestor of HOME (e.g. /Users)
+    if norm in (home_str, os.sep) or home_str.startswith(norm.rstrip(os.sep) + os.sep):
+        return True
+    # System folders directly under root
+    if norm in ("/Applications", "/Library", "/System", "/Volumes", "/tmp", "/private/tmp", "/var", "/private/var"):
+        return True
+    # Direct child under /Volumes (e.g. /Volumes/Macintosh HD)
+    if norm.startswith("/Volumes/"):
+        parts = [p for p in norm.split("/") if p]
+        if len(parts) <= 2:
+            return True
+    return False
+
+
+def _is_project_root(path: str) -> bool:
+    """Check if directory contains markers of an actual project root (.git or .agent-pair)."""
+    try:
+        p = Path(path)
+        if not p.is_dir():
+            return False
+        return (p / ".git").exists() or (p / ".agent-pair").is_dir()
+    except Exception:
+        return False
+
+
+def _scan_top_level_symlinks(dir_path: str, target_path: str) -> bool:
+    """
+    Scan top-level of dir_path for symlinks pointing to target_path.
+    Enforces R4 safety boundaries:
+      - Excludes $HOME, /, or /Volumes/* from scanning.
+      - Disregards symlinks resolving to broad directories ($HOME, /, /Volumes, etc.).
+      - Ancestor relaxation (target_path inside resolved) is ONLY accepted if resolved target
+        is a verified project root (has .git or .agent-pair); otherwise requires exact match.
+    Single-level only, non-recursive, safe against symlink loops.
+    """
+    try:
+        p = Path(dir_path)
+        if not p.is_dir():
+            return False
+        if _is_broad_directory(dir_path):
+            return False
+        with os.scandir(dir_path) as it:
+            for entry in it:
+                try:
+                    if entry.is_symlink():
+                        resolved = normalize_path(entry.path)
+                        if not resolved or _is_broad_directory(resolved):
+                            continue
+                        if resolved == target_path:
+                            return True
+                        # Ancestor relaxation only if resolved target is a project root (.git or .agent-pair)
+                        if _is_project_root(resolved) and target_path.startswith(resolved.rstrip(os.sep) + os.sep):
+                            return True
+                except (OSError, PermissionError):
+                    continue
+    except (OSError, PermissionError):
+        pass
+    return False
+
+
 def cwd_relation(session_cwd: str | None, cwd: str | None) -> str | None:
     """
     Classify how a session's CWD relates to the caller's CWD:
       - "exact":    same directory (after symlink resolution)
+      - "linked":   aliased in .agent-pair/config.json or connected via top-level symlink
       - "ancestor": session runs at a parent directory of the caller (e.g. repo root vs. subdir)
       - None:       unrelated
     $HOME and / never count as ancestors, so a home-directory session can't claim every project.
@@ -297,20 +400,52 @@ def cwd_relation(session_cwd: str | None, cwd: str | None) -> str | None:
         return None
     if a == b:
         return "exact"
-    if a in (normalize_path(str(Path.home())), os.sep):
+    if _is_broad_directory(a):
         return None
+
+    # 1. Configured project aliases (bi-directional check)
+    a_aliases = load_project_aliases(a)
+    b_aliases = load_project_aliases(b)
+    if a in b_aliases or b in a_aliases:
+        return "linked"
+
+    # 2. Top-level symlink scan (R4 safe boundary)
+    if _scan_top_level_symlinks(a, b) or _scan_top_level_symlinks(b, a):
+        return "linked"
+
+    # 3. Ancestor check: b is a subdirectory inside a
     if b.startswith(a.rstrip(os.sep) + os.sep):
         return "ancestor"
+
     return None
 
 
 def filter_project_sessions(candidates: list[dict], cwd: str | None = None) -> list[dict]:
-    """Return sessions whose CWD exactly matches the caller's; otherwise those at an ancestor directory."""
+    """
+    Return sessions whose CWD relates to the caller's CWD, strictly prioritizing:
+      1. exact: same directory
+      2. linked: project aliases or top-level symlinks
+      3. ancestor: parent directory
+    Single-pass bucketing to avoid redundant scans.
+    """
     cwd = cwd or os.getcwd()
-    exact = [c for c in candidates if cwd_relation(c.get("cwd"), cwd) == "exact"]
+    exact = []
+    linked = []
+    ancestor = []
+    for c in candidates:
+        rel = cwd_relation(c.get("cwd"), cwd)
+        if rel == "exact":
+            exact.append(c)
+        elif rel == "linked":
+            linked.append(c)
+        elif rel == "ancestor":
+            ancestor.append(c)
+
     if exact:
         return exact
-    return [c for c in candidates if cwd_relation(c.get("cwd"), cwd) == "ancestor"]
+    if linked:
+        return linked
+    return ancestor
 
 
 def get_secure_run_dir() -> Path:
@@ -558,6 +693,9 @@ def format_peer_envelope(
     action: str | None = None,
     reply_command: str | None = None,
     expected_artifact: str | None = None,
+    caller_cwd: str | None = None,
+    target_cwd: str | None = None,
+    cwd_relation_type: str | None = None,
 ) -> str:
     """
     Format message using the standardized Peer Envelope specification.
@@ -573,6 +711,12 @@ def format_peer_envelope(
         f"- 请求方：{sender} (Local Pair Programming Agent)",
         f"- 操作边界声明：{_intent_boundary(intent, action)}",
     ]
+    if caller_cwd and target_cwd:
+        if cwd_relation_type is None:
+            lines.append(f"- 工程上下文：⚠️ 跨工程调用警示！请求方 CWD 为 `{caller_cwd}`，你的 CWD 为 `{target_cwd}`；文中涉及的文件相对路径以请求方为准，可能不在你的当前工作区内。")
+        elif cwd_relation_type == "linked":
+            lines.append(f"- 工程上下文：🔗 关联/软链接工程 (`{caller_cwd}` ≙ `{target_cwd}`)。")
+
     if expected_artifact:
         lines.append(f"- 预期交付产物：{expected_artifact}")
 
