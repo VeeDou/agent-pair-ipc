@@ -65,7 +65,7 @@ flowchart TD
 - 🔌 **原生支持主流双引擎**：
   - **Claude Code**：通过 Unix Domain Socket（UDS）进行双向鉴权通信，实时解析会话 JSONL 转储。
   - **OpenAI Codex**：利用原生 `codex queue` 管道投递消息，精准监控 Rollout 事件流中的 `Reasoning`、工具调用与 `task_complete`。
-- 🎯 **多工程路由防线与 CWD 亲和性强校验**：基于当前工作目录自动匹配同源会话；强校验 `bindings.json` 与环境变量，失效脏绑定自动告警并回退探测；显式跨工程调用注入高亮 Markdown 警示信封。
+- 🎯 **多工程路由防线与 CWD 亲和性硬阻断**：基于当前工作目录自动匹配同源会话；强校验 `bindings.json` 与环境变量，失效脏绑定自动告警并回退探测；默认严格硬阻断跨工程串线投递（`cross_project_rejected`），跨工程调用强制要求 `--allow-cross-project=<目标路径>` 显式放行且严禁使用易复用的 PID。
 - 🔗 **多工程别名与软链接感知**：支持在 `.agent-pair/config.json` 中配置 `"aliases": [...]` 别名工作区；支持单层顶层软链接感知与严格的工程根边界保护（非真实项目根禁止祖先路径放宽，杜绝误匹配 `$HOME` 等根目录）。
 - 🛡️ **路径参数防呆与名称去歧义**：拦截误传给 `-s` 的文件路径并给出指引，同时放行包含斜杠的合法会话标题（如 `"UI/UX 评审"`）；名称子串多重匹配严格拒绝猜选。
 - 📁 **文件化 Payload 管道（`-f` / `-f -`）**：文件或带引号 heredoc 经 stdin 传递，反引号与 `$(...)` 原样保留；Codex 超长正文自动落盘为 0600 文件，不再塞进 argv。

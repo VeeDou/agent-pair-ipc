@@ -12,6 +12,7 @@ import json
 import os
 import re
 import socket
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -202,6 +203,7 @@ def match_session(
     candidates: list[dict] | None = None,
     allow_cwd_fallback: bool = True,
     pick_latest: bool = False,
+    allow_cross_project: bool = False,
     debug: bool = False,
 ) -> tuple[dict | None, str]:
     """
@@ -308,7 +310,33 @@ def match_session(
             else:
                 # source_kind == "cli_flag"
                 if relation is None:
-                    print(f"[Claude Code IPC] ⚠️ NOTICE: 跨工程调用警示！目标会话运行在 '{matched.get('cwd')}'，与当前目录 '{current_cwd}' 不一致！", file=sys.stderr)
+                    is_pid_target = target_str.isdigit() or (matched and str(matched.get("pid")) == target_str)
+                    if is_pid_target:
+                        print(f"\n[Claude Code IPC] ❌ Error: 拒绝跨工程串线投递！跨工程投递严禁使用 PID [{target_str}] 作为目标！", file=sys.stderr)
+                        print("   PID 会被操作系统频繁回收和复用，在跨工程调用中极易引发严重的串线事故。", file=sys.stderr)
+                        print("   如确实需要跨工程通信，请使用稳定的会话 ID（UUID / hostSessionId）或会话标题，并配合 `--allow-cross-project`。\n", file=sys.stderr)
+                        return None, "cross_project_rejected"
+
+                    target_cwd = matched.get("cwd") or ""
+                    status_info = f" (状态: {matched.get('status')})" if matched.get("status") else ""
+                    title_info = matched.get("name") or matched.get("host_session_id") or matched.get("session_id")
+
+                    if not allow_cross_project or allow_cross_project is True or allow_cross_project == "*":
+                        print(f"\n[Claude Code IPC] ❌ Error: 拒绝跨工程串线投递！", file=sys.stderr)
+                        print(f"   指定的目标会话 \"{title_info}\"{status_info} 运行在 '{target_cwd}'，与当前工程 '{current_cwd}' 完全无关！", file=sys.stderr)
+                        print("👉 为防止污染无关项目的上下文与聊天记录，工具默认严格阻断跨目录调用。", file=sys.stderr)
+                        print("   如确实需要跨目录调用，请显式追加 `--allow-cross-project=<目标工程路径>` 明确确认目标工程路径，且不得使用 PID。\n", file=sys.stderr)
+                        return None, "cross_project_rejected"
+
+                    norm_allowed = os.path.realpath(os.path.expanduser(str(allow_cross_project)))
+                    norm_target = os.path.realpath(target_cwd) if target_cwd else ""
+                    if norm_allowed != norm_target:
+                        print(f"\n[Claude Code IPC] ❌ Error: `--allow-cross-project` 指定的目标工程路径 '{allow_cross_project}' 与目标会话实际运行路径 '{target_cwd}' 不一致！\n", file=sys.stderr)
+                        return None, "cross_project_rejected"
+
+                    if matched.get("status") == "busy":
+                        print(f"[Claude Code IPC] ⚠️ Warning: 目标跨工程会话当前处于 busy 忙碌状态，可能正在执行其他工程任务。", file=sys.stderr)
+                    print(f"[Claude Code IPC] ⚠️ NOTICE: 跨工程调用已显式允许。目标会话运行在 '{target_cwd}'，与当前目录 '{current_cwd}' 不一致！", file=sys.stderr)
                 return matched, "matched"
 
         if resolved_target:
@@ -448,18 +476,38 @@ def _resolve_or_await_session(
     auto_await_new: bool,
     activate_gui: bool,
     await_timeout: float,
-    debug: bool,
+    allow_cross_project: bool | str = False,
+    debug: bool = False,
 ) -> tuple[dict | None, str]:
     """Shared session resolution for send / send-and-wait. Raises NeedsNewSessionError in non-TTY."""
     candidates = get_active_sessions(exclude_self=True, debug=debug)
-    session, status = match_session(target=target, candidates=candidates, pick_latest=pick_latest, debug=debug) if candidates else (None, "none")
-    if session or status in ("ambiguous", "invalid_target"):
+    session, status = match_session(target=target, candidates=candidates, pick_latest=pick_latest, allow_cross_project=allow_cross_project, debug=debug) if candidates else (None, "none")
+    if session or status in ("ambiguous", "invalid_target", "cross_project_rejected"):
         return session, status
     resolved_target, _ = resolve_target_session(target)
     if resolved_target is None and auto_await_new:
         session = await_new_session(timeout=await_timeout, cwd=os.getcwd(), activate_gui=activate_gui, debug=debug)
         return session, ("matched" if session else "none")
     return None, status
+
+
+def wrap_cross_session_xml(content: str, sender: str = "ext:Antigravity", mode: str = "prompting") -> str:
+    """
+    Wrap message in Claude Code 2.1+ native cross-session XML envelope with honest mode assertion.
+    External callers are hardcoded to from-mode="prompting" to eliminate permission spoofing.
+    Prefix sender with 'ext:' to prevent spoofing internal session names.
+    Strictly follows Claude Code regex:
+      ^<cross-session-message(?: from="...")?(?: from-name="...")?(?: from-mode="...")?>\\n([\\s\\S]*)\\n</cross-session-message>$
+    """
+    if content.strip().startswith("<cross-session-message"):
+        return content
+
+    clean_sender = re.sub(r'["<>\n\r]', '', sender or "Antigravity").strip() or "Antigravity"
+    if not clean_sender.startswith("ext:"):
+        clean_sender = f"ext:{clean_sender}"
+    clean_mode = "prompting"
+    escaped = content.replace("</cross-session-message>", "<\\/cross-session-message>")
+    return f'<cross-session-message from="{clean_sender}" from-name="{clean_sender}" from-mode="{clean_mode}">\n{escaped}\n</cross-session-message>'
 
 
 def send_message_to_claude(
@@ -474,17 +522,18 @@ def send_message_to_claude(
     activate_gui: bool = False,
     sender: str | None = None,
     await_timeout: float = DEFAULT_AWAIT_TIMEOUT,
+    allow_cross_project: bool | str = False,
     debug: bool = False,
 ) -> bool:
     """
     Send message to target Claude Code session via Unix Domain Socket.
-    Messages not yet enveloped are wrapped in a Peer Envelope that tells the peer how to answer
-    with `agent-pair-ipc reply --to <nonce>`; a reply sent while nobody waits lands in the mailbox.
-    Attaches handshake metadata (ipc_version, request_id, caller, expected_artifact, callback_socket).
+    Messages not yet enveloped are wrapped in a Peer Envelope that guides the peer
+    to answer via conversation transcript or deliverable artifact (zero-click).
+    Attaches handshake metadata (ipc_version, request_id, caller, caller_mode, expected_artifact).
     """
-    session, status = _resolve_or_await_session(target, pick_latest, auto_await_new, activate_gui, await_timeout, debug)
+    session, status = _resolve_or_await_session(target, pick_latest, auto_await_new, activate_gui, await_timeout, allow_cross_project, debug)
     if not session:
-        if status not in ("ambiguous", "invalid_target"):
+        if status not in ("ambiguous", "invalid_target", "cross_project_rejected"):
             _report_missing_session(target)
         return False
 
@@ -505,19 +554,21 @@ def send_message_to_claude(
             intent=intent,
             user_context=user_context,
             reply_socket=reply_socket,
-            reply_command=build_reply_command(),
+            reply_command=None,
             expected_artifact=expected_artifact,
             caller_cwd=current_cwd,
             target_cwd=session.get("cwd"),
             cwd_relation_type=rel,
         )
 
-    # Standardized Handshake Metadata
+    # Standardized Handshake Metadata & Caller Mode Declaration (honest prompting mode)
     caller_name = sender or detect_sender()
+    caller_mode = "prompting"
     metadata: dict[str, str] = {
         "ipc_version": "2.1",
         "request_id": nonce,
         "caller": caller_name,
+        "caller_mode": caller_mode,
     }
     if rel is None and session.get("cwd"):
         metadata["cross_project"] = "true"
@@ -530,6 +581,8 @@ def send_message_to_claude(
     if reply_socket:
         metadata["callback_socket"] = str(reply_socket)
 
+    final_payload = wrap_cross_session_xml(message, sender=caller_name, mode=caller_mode)
+
     try:
         s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         s.settimeout(10.0)
@@ -540,7 +593,7 @@ def send_message_to_claude(
             "type": "user",
             "message": {
                 "role": "user",
-                "content": message,
+                "content": final_payload,
                 "metadata": metadata,
             }
         }) + "\n"
@@ -558,7 +611,7 @@ def send_message_to_claude(
 
         display_name = session["name"] or session["session_id"]
         sess_id = session["host_session_id"] or session["session_id"]
-        print(f"[Claude Code IPC] Message successfully delivered to session PID {session['pid']} ({display_name}) [ID: {sess_id}] (Req-ID: {nonce}).")
+        print(f"[Claude Code IPC] Message successfully delivered to session PID {session['pid']} ({display_name}) [ID: {sess_id}] (Req-ID: {nonce}, Mode: {caller_mode}).")
         if expected_artifact:
             print(f"[Claude Code IPC] Handshake: Expected artifact registered -> {expected_artifact}", file=sys.stderr)
         if session.get("status") == "busy":
@@ -706,13 +759,13 @@ def send_and_wait(
     activate_gui: bool = False,
     sender: str | None = None,
     await_timeout: float = DEFAULT_AWAIT_TIMEOUT,
+    allow_cross_project: bool | str = False,
     debug: bool = False,
 ) -> tuple[str | None, str | None]:
     """
     Send message to Claude Code with request correlation nonce and wait synchronously.
     Uses multi-channel listening:
-      1. Duplex reply channel: ephemeral socket ~/.agent-pair/run/reply-<nonce>.sock (+ mailbox),
-         which the peer answers via `agent-pair-ipc reply --to <nonce>` (advertised in the envelope)
+      1. Duplex reply channel: ephemeral socket ~/.agent-pair/run/reply-<nonce>.sock (+ mailbox)
       2. Fast-fail checks: target PID liveness & socket liveness
       3. Expected artifact auto-detection: checks if `expect_file` has been written and stabilized
       4. Incremental TailReader on the JSONL transcript with unconsumed fast-fail protection
@@ -722,12 +775,12 @@ def send_and_wait(
     """
     sender = sender or sender_name or detect_sender()
     try:
-        session, status = _resolve_or_await_session(target, pick_latest, auto_await_new, activate_gui, await_timeout, debug)
+        session, status = _resolve_or_await_session(target, pick_latest, auto_await_new, activate_gui, await_timeout, allow_cross_project, debug)
     except NeedsNewSessionError:
         return None, "NEEDS_NEW_THREAD"
 
     if not session:
-        if status not in ("ambiguous", "invalid_target"):
+        if status not in ("ambiguous", "invalid_target", "cross_project_rejected"):
             _report_missing_session(target)
         return None, None
 
@@ -778,7 +831,7 @@ def send_and_wait(
         intent=intent,
         user_context=user_context,
         reply_socket=reply_sock_path,
-        reply_command=build_reply_command(),
+        reply_command=None,
         expected_artifact=str(expect_path) if expect_path else (str(expect_file) if expect_file else None),
         caller_cwd=current_cwd,
         target_cwd=session.get("cwd"),
@@ -788,12 +841,13 @@ def send_and_wait(
     try:
         ok = send_message_to_claude(
             full_message,
-            target=session["host_session_id"] or str(session["pid"]),
+            target=session["host_session_id"] or session["session_id"] or str(session["pid"]),
             expected_artifact=str(expect_path) if expect_path else (str(expect_file) if expect_file else None),
             reply_socket=reply_sock_path,
             pick_latest=pick_latest,
             auto_await_new=False,
             activate_gui=False,
+            allow_cross_project=allow_cross_project,
             debug=debug,
         )
         if not ok:
@@ -1031,6 +1085,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("-t", "--timeout", "--wait-timeout", dest="timeout", type=float, default=300.0, help="Wait timeout in seconds (default: 300)")
     parser.add_argument("--expect-file", "--output-file", dest="expect_file", default=None, help="Expected deliverable file path. Auto-detects completion when file settles with verdict.")
     parser.add_argument("--fast-fail-timeout", type=float, default=45.0, help="Fast fail timeout in seconds if request is not even enqueued (default: 45.0, 0 to disable)")
+    parser.add_argument("--allow-cross-project", dest="allow_cross_project", metavar="TARGET_DIR", default=None, help="Explicitly allow cross-project message delivery. Must specify target project path, e.g. --allow-cross-project=/path/to/project")
     parser.add_argument("--debug", action="store_true", help="Enable verbose debug logs")
     return parser
 
@@ -1110,6 +1165,7 @@ def main(argv: list[str] | None = None) -> int:
             activate_gui=args.activate_gui,
             sender=args.sender,
             await_timeout=args.await_timeout,
+            allow_cross_project=args.allow_cross_project,
             debug=args.debug,
         )
         if verdict == "QUEUED_UNCONSUMED":
@@ -1142,6 +1198,7 @@ def main(argv: list[str] | None = None) -> int:
             activate_gui=args.activate_gui,
             sender=args.sender,
             await_timeout=args.await_timeout,
+            allow_cross_project=args.allow_cross_project,
             debug=args.debug,
         )
         return EXIT_SIGN_OFF if ok else EXIT_ERROR

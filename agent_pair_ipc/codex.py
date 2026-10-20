@@ -172,6 +172,7 @@ def match_session(
     candidates: list[dict] | None = None,
     allow_cwd_fallback: bool = True,
     pick_latest: bool = False,
+    allow_cross_project: bool | str = False,
     debug: bool = False,
 ) -> tuple[dict | None, str]:
     """
@@ -262,7 +263,23 @@ def match_session(
             else:
                 # source_kind == "cli_flag"
                 if relation is None:
-                    print(f"[Codex IPC] ⚠️ NOTICE: 跨工程调用警示！目标会话运行在 '{matched.get('cwd')}'，与当前目录 '{current_cwd}' 不一致！", file=sys.stderr)
+                    target_cwd = matched.get("cwd") or ""
+                    title_info = matched.get("name") or matched.get("id")
+
+                    if not allow_cross_project or allow_cross_project is True or allow_cross_project == "*":
+                        print(f"\n[Codex IPC] ❌ Error: 拒绝跨工程串线投递！", file=sys.stderr)
+                        print(f"   指定的目标会话 \"{title_info}\" 运行在 '{target_cwd}'，与当前工程 '{current_cwd}' 完全无关！", file=sys.stderr)
+                        print("👉 为防止污染无关项目的上下文与聊天记录，工具默认严格阻断跨目录调用。", file=sys.stderr)
+                        print("   如确实需要跨目录调用，请显式追加 `--allow-cross-project=<目标工程路径>` 明确确认目标工程路径。\n", file=sys.stderr)
+                        return None, "cross_project_rejected"
+
+                    norm_allowed = os.path.realpath(os.path.expanduser(str(allow_cross_project)))
+                    norm_target = os.path.realpath(target_cwd) if target_cwd else ""
+                    if norm_allowed != norm_target:
+                        print(f"\n[Codex IPC] ❌ Error: `--allow-cross-project` 指定的目标工程路径 '{allow_cross_project}' 与目标会话实际运行路径 '{target_cwd}' 不一致！\n", file=sys.stderr)
+                        return None, "cross_project_rejected"
+
+                    print(f"[Codex IPC] ⚠️ NOTICE: 跨工程调用已显式允许。目标会话运行在 '{target_cwd}'，与当前目录 '{current_cwd}' 不一致！", file=sys.stderr)
                 return matched, "matched"
 
         if resolved_target:
@@ -515,11 +532,12 @@ def _resolve_or_await_session(
     auto_await_new: bool,
     activate_gui: bool,
     await_timeout: float,
-    debug: bool,
+    allow_cross_project: bool | str = False,
+    debug: bool = False,
 ) -> tuple[dict | None, str]:
     """Shared session resolution for send / send-and-wait. Raises NeedsNewSessionError in non-TTY."""
-    session, status = match_session(target=target, pick_latest=pick_latest, debug=debug)
-    if session or status in ("ambiguous", "invalid_target"):
+    session, status = match_session(target=target, pick_latest=pick_latest, allow_cross_project=allow_cross_project, debug=debug)
+    if session or status in ("ambiguous", "invalid_target", "cross_project_rejected"):
         return session, status
     resolved_target, _ = resolve_target_session(target)
     if resolved_target is None and auto_await_new:
@@ -540,6 +558,7 @@ def send_message_to_codex(
     activate_gui: bool = False,
     sender: str | None = None,
     await_timeout: float = DEFAULT_AWAIT_TIMEOUT,
+    allow_cross_project: bool | str = False,
     debug: bool = False,
 ) -> bool:
     """
@@ -548,9 +567,9 @@ def send_message_to_codex(
     evaluated), but argv is size-limited: oversized bodies are moved to a 0o600 payload file
     and the queued message carries the envelope plus a pointer to that file.
     """
-    session, status = _resolve_or_await_session(target, pick_latest, auto_await_new, activate_gui, await_timeout, debug)
+    session, status = _resolve_or_await_session(target, pick_latest, auto_await_new, activate_gui, await_timeout, allow_cross_project, debug)
     if not session:
-        if status not in ("ambiguous", "invalid_target"):
+        if status not in ("ambiguous", "invalid_target", "cross_project_rejected"):
             _report_missing_session(target)
         return False
 
@@ -571,7 +590,7 @@ def send_message_to_codex(
             intent=intent,
             user_context=user_context,
             reply_socket=reply_socket,
-            reply_command=build_reply_command(),
+            reply_command=None,
             expected_artifact=expected_artifact,
             caller_cwd=current_cwd,
             target_cwd=session.get("cwd"),
@@ -675,13 +694,13 @@ def send_and_wait(
     activate_gui: bool = False,
     sender: str | None = None,
     await_timeout: float = DEFAULT_AWAIT_TIMEOUT,
+    allow_cross_project: bool | str = False,
     debug: bool = False,
 ) -> tuple[str | None, str | None]:
     """
     Send message to Codex with correlation nonce and wait synchronously.
     Uses multi-channel listening:
-      1. Duplex reply channel: ephemeral socket ~/.agent-pair/run/reply-<nonce>.sock (+ mailbox),
-         which the peer answers via `agent-pair-ipc reply --to <nonce>` (advertised in the envelope)
+      1. Duplex reply channel: ephemeral socket ~/.agent-pair/run/reply-<nonce>.sock (+ mailbox)
       2. Expected deliverable auto-detection: checks if `expect_file` has been written and stabilized
       3. Incremental TailReader on JSONL rollout transcript with fast-fail detection
 
@@ -690,12 +709,12 @@ def send_and_wait(
     """
     sender = sender or sender_name or detect_sender()
     try:
-        session, status = _resolve_or_await_session(target, pick_latest, auto_await_new, activate_gui, await_timeout, debug)
+        session, status = _resolve_or_await_session(target, pick_latest, auto_await_new, activate_gui, await_timeout, allow_cross_project, debug)
     except NeedsNewSessionError:
         return None, "NEEDS_NEW_THREAD"
 
     if not session:
-        if status not in ("ambiguous", "invalid_target"):
+        if status not in ("ambiguous", "invalid_target", "cross_project_rejected"):
             _report_missing_session(target)
         return None, None
 
@@ -749,7 +768,7 @@ def send_and_wait(
         intent=intent,
         user_context=user_context,
         reply_socket=reply_sock_path,
-        reply_command=build_reply_command(),
+        reply_command=None,
         expected_artifact=str(expect_path) if expect_path else (str(expect_file) if expect_file else None),
         caller_cwd=current_cwd,
         target_cwd=session.get("cwd"),
@@ -765,6 +784,7 @@ def send_and_wait(
             pick_latest=pick_latest,
             auto_await_new=False,
             activate_gui=False,
+            allow_cross_project=allow_cross_project,
             debug=debug,
         )
         if not ok:
@@ -974,6 +994,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--expect-file", "--output-file", dest="expect_file", default=None, help="Expected deliverable file path. Auto-detects completion when file settles with verdict.")
     parser.add_argument("--fast-fail", type=float, default=15.0, help="Fast fail timeout in seconds if nonce not consumed (default: 15.0)")
     parser.add_argument("--no-auto-new", action="store_true", help="Disable automatic wait-for-new-thread when no session exists for project")
+    parser.add_argument("--allow-cross-project", dest="allow_cross_project", metavar="TARGET_DIR", default=None, help="Explicitly allow cross-project message delivery. Must specify target project path, e.g. --allow-cross-project=/path/to/project")
     parser.add_argument("--debug", action="store_true", help="Enable verbose debug logs")
     return parser
 
@@ -1053,6 +1074,7 @@ def main(argv: list[str] | None = None) -> int:
             activate_gui=args.activate_gui,
             sender=args.sender,
             await_timeout=args.await_timeout,
+            allow_cross_project=args.allow_cross_project,
             debug=args.debug,
         )
         if verdict == "QUEUED_UNCONSUMED":
@@ -1083,6 +1105,7 @@ def main(argv: list[str] | None = None) -> int:
             activate_gui=args.activate_gui,
             sender=args.sender,
             await_timeout=args.await_timeout,
+            allow_cross_project=args.allow_cross_project,
             debug=args.debug,
         )
         return EXIT_SIGN_OFF if ok else EXIT_ERROR

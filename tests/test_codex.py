@@ -413,7 +413,7 @@ class TestCodex(unittest.TestCase):
         slash_session = {
             "id": "thread-slash-title",
             "name": "UI/UX 评审",
-            "cwd": "/Users/liuvictory/projects/AI_PM",
+            "cwd": os.getcwd(),
             "jsonl_path": "/fake/tr.jsonl",
             "mtime": 100.0,
         }
@@ -475,6 +475,42 @@ class TestCodex(unittest.TestCase):
             self.assertIsNotNone(sess)
             self.assertEqual(sess["id"], "current-thread")
             self.assertEqual(status, "matched")
+
+    def test_codex_cross_project_rejection_and_overrides(self):
+        from agent_pair_ipc.codex import match_session
+
+        foreign_session = {
+            "id": "thread-foreign-001",
+            "name": "Duanju Codex Thread",
+            "cwd": "/tmp/unrelated_foreign_dir",
+            "jsonl_path": "/fake/tr.jsonl",
+            "mtime": 100.0,
+        }
+
+        # 1. Default without allow_cross_project: hard rejection
+        sess, status = match_session(target="thread-foreign-001", candidates=[foreign_session], allow_cross_project=False)
+        self.assertIsNone(sess)
+        self.assertEqual(status, "cross_project_rejected")
+
+        # 2. Allow cross project with matching directory path
+        sess_ok, status_ok = match_session(target="thread-foreign-001", candidates=[foreign_session], allow_cross_project="/tmp/unrelated_foreign_dir")
+        self.assertIsNotNone(sess_ok)
+        self.assertEqual(status_ok, "matched")
+
+        # 3. Reject when allow_cross_project path does not match target CWD
+        sess_bad, status_bad = match_session(target="thread-foreign-001", candidates=[foreign_session], allow_cross_project="/tmp/other_dir")
+        self.assertIsNone(sess_bad)
+        self.assertEqual(status_bad, "cross_project_rejected")
+
+        # 4. Reject when allow_cross_project is '*' (wildcard must not bypass)
+        sess_wild, status_wild = match_session(target="thread-foreign-001", candidates=[foreign_session], allow_cross_project="*")
+        self.assertIsNone(sess_wild)
+        self.assertEqual(status_wild, "cross_project_rejected")
+
+        # 5. Reject when allow_cross_project is True (must require explicit path)
+        sess_true, status_true = match_session(target="thread-foreign-001", candidates=[foreign_session], allow_cross_project=True)
+        self.assertIsNone(sess_true)
+        self.assertEqual(status_true, "cross_project_rejected")
 
 
 if __name__ == "__main__":
