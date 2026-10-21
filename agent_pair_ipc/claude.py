@@ -491,6 +491,112 @@ def _resolve_or_await_session(
     return None, status
 
 
+def _read_inbound_setting_from_file(p: Path) -> tuple[bool, str | None, str | None]:
+    """
+    Safely reads 'crossSessionInbound' from JSON file p (read-only).
+    Returns (file_exists_and_valid_json, raw_str_value, error_note).
+    """
+    if not p.is_file():
+        return False, None, None
+    try:
+        with open(p, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if not isinstance(data, dict):
+            return True, None, "root is not a JSON object"
+        raw = data.get("crossSessionInbound")
+        if raw is None:
+            return True, None, None
+        return True, str(raw).strip(), None
+    except Exception as e:
+        return True, None, f"JSON parse error: {e}"
+
+
+def resolve_cross_session_inbound_policy(
+    target_cwd: str | Path | None = None,
+    home_dir: str | Path | None = None,
+    managed_path: str | Path | None = None,
+) -> tuple[str, str]:
+    """
+    Resolve the effective crossSessionInbound policy for a target Claude Code session
+    using Claude Code 2.1+ configuration cascade (strictly read-only).
+
+    Cascade precedence:
+      1. Managed settings (cannot be overridden by user or repo):
+         - macOS: /Library/Application Support/ClaudeCode/managed-settings.json
+         - Linux: /etc/claude-code/managed-settings.json
+      2. Repository settings in target_cwd (can only tighten to 'hold' or 'refuse'):
+         - <target_cwd>/.claude/settings.local.json
+         - <target_cwd>/.claude/settings.json
+      3. User global settings:
+         - ~/.claude/settings.local.json
+         - ~/.claude/settings.json
+
+    Returns:
+      (inferred_policy, source_description)
+    """
+    valid_policies = {"accept", "hold", "refuse"}
+
+    # 1. Managed settings
+    if managed_path is not None:
+        managed_candidates = [Path(managed_path)]
+    else:
+        managed_candidates = [
+            Path("/Library/Application Support/ClaudeCode/managed-settings.json"),
+            Path("/etc/claude-code/managed-settings.json"),
+        ]
+
+    for cand in managed_candidates:
+        exists, raw, _ = _read_inbound_setting_from_file(cand)
+        if exists and raw is not None:
+            norm = raw.lower()
+            if norm not in valid_policies:
+                return "hold", f"组织托管配置中有未识别值: {cand} (取值: '{raw}')"
+            return norm, f"组织托管配置: {cand} (不可被用户或仓库覆盖)"
+
+    # 2. Repository settings (if target_cwd is provided)
+    repo_accept: tuple[str, str] | None = None
+    if target_cwd:
+        try:
+            cwd_path = Path(target_cwd).resolve()
+            repo_candidates = [
+                cwd_path / ".claude" / "settings.local.json",
+                cwd_path / ".claude" / "settings.json",
+            ]
+            for cand in repo_candidates:
+                exists, raw, _ = _read_inbound_setting_from_file(cand)
+                if exists and raw is not None:
+                    norm = raw.lower()
+                    if norm not in valid_policies:
+                        return "hold", f"仓库配置中有未识别值: {cand} (取值: '{raw}')"
+                    if norm in ("hold", "refuse"):
+                        return norm, f"仓库收紧配置: {cand} (用户配置无法突破)"
+                    if norm == "accept" and not repo_accept:
+                        repo_accept = ("accept", f"仓库配置: {cand}")
+        except Exception:
+            pass
+
+    # 3. User global settings
+    hdir = Path(home_dir).resolve() if home_dir else Path.home()
+    user_candidates = [
+        hdir / ".claude" / "settings.local.json",
+        hdir / ".claude" / "settings.json",
+    ]
+    for cand in user_candidates:
+        exists, raw, _ = _read_inbound_setting_from_file(cand)
+        if exists and raw is not None:
+            norm = raw.lower()
+            if norm not in valid_policies:
+                return "hold", f"用户配置中有未识别值: {cand} (取值: '{raw}')"
+            return norm, f"用户全局配置: {cand}"
+
+    # If repo set accept and user didn't specify otherwise
+    if repo_accept:
+        return repo_accept
+
+    # 4. Default policy
+    return "parity_check", "未显式配置 crossSessionInbound (默认按模式对齐判定)"
+
+
 def wrap_cross_session_xml(content: str, sender: str = "ext:Antigravity", mode: str = "prompting") -> str:
     """
     Wrap message in Claude Code 2.1+ native cross-session XML envelope with honest mode assertion.
@@ -617,7 +723,7 @@ def send_message_to_claude(
         if session.get("status") == "busy":
             print("[Claude Code IPC] Note: Target session is busy; the message will be processed after its current turn.", file=sys.stderr)
         if session.get("entrypoint") == "claude-desktop":
-            print("[Claude Code IPC] Tip: Target is Claude Desktop. If the window is inactive, switch to it to wake message processing.", file=sys.stderr)
+            print("[Claude Code IPC] Tip: Target is Claude Desktop. If the session holds inbound traffic, check for a review card at the bottom of the chat.", file=sys.stderr)
         return True
     except Exception as e:
         print(f"[Claude Code IPC] Failed to send message to socket {sock_path}: {e}", file=sys.stderr)
@@ -970,10 +1076,15 @@ def send_and_wait(
 
             # Fast-fail: Request was not even enqueued in transcript after fast_fail_timeout
             if not is_enqueued and fast_fail_timeout > 0 and elapsed > fast_fail_timeout:
-                print(f"\n[Claude Code IPC] Notice: Message was delivered to socket but not enqueued within {int(fast_fail_timeout)}s (Req-ID: {nonce}).", file=sys.stderr)
-                print(f"[Claude Code IPC] Target session \"{session.get('name')}\" [PID: {session['pid']}] may be suspended in background or inactive.", file=sys.stderr)
-                print("[Claude Code IPC] NOTE: If the session was asleep, switch to Claude Desktop to wake it up.", file=sys.stderr)
-                print(f"[Claude Code IPC] Action: Check later using `agent-pair-ipc inbox {nonce}` or `claude-ipc -r`.\n", file=sys.stderr)
+                policy, policy_src = resolve_cross_session_inbound_policy(session.get("cwd"))
+                print(f"\n[Claude Code IPC] 提示: 消息已通过 Socket 送达进程，但在 {int(fast_fail_timeout)} 秒内未进入工作队列 (Req-ID: {nonce})。", file=sys.stderr)
+                print(f"[Claude Code IPC] 这通常是因为目标会话的安全策略正在等待人工审核（入站扣留），或者该会话当前处于挂起状态。", file=sys.stderr)
+                print(f"[Claude Code IPC] 目标会话: \"{session.get('name')}\" [PID: {session['pid']}]", file=sys.stderr)
+                print("\n👉 排查建议（按安全推荐顺序）：", file=sys.stderr)
+                print("  1. [首选] 请在 Claude Desktop 中切换到该会话，查看聊天记录底部是否有「待审核卡片」，点击批准即可放行；", file=sys.stderr)
+                print("  2. 建议日常开发使用 auto 或默认交互模式（已观察到与外部 Agent 的 prompting 模式保持对齐，避免触发扣留）；", file=sys.stderr)
+                print(f"  3. 当前推断生效的入站配置: [策略: {policy}] (来源: {policy_src})；", file=sys.stderr)
+                print("  4. 了解更多跨 Agent 自动化配置与安全风险，请查阅 SECURITY.md §6。\n", file=sys.stderr)
                 return None, "QUEUED_UNCONSUMED"
 
             # Inform if enqueued and waiting for busy previous turn
@@ -987,7 +1098,7 @@ def send_and_wait(
 
             if session.get("entrypoint") == "claude-desktop" and not warned_idle and elapsed > 8.0 and not is_enqueued:
                 warned_idle = True
-                print("[Claude Code IPC] Notice: Claude Desktop has not started processing yet. If window is in background, switch to it to wake it up.", file=sys.stderr)
+                print("[Claude Code IPC] Notice: Target session has not started processing. Check if an inbound review card is pending at the bottom of the session.", file=sys.stderr)
 
         print(f"[Claude Code IPC] Timed out waiting for response after {int(timeout)}s (Req-ID: {nonce}).", file=sys.stderr)
         print(f"[Claude Code IPC] A late reply will be kept in the mailbox: agent-pair-ipc inbox {nonce}", file=sys.stderr)
@@ -1085,6 +1196,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("-t", "--timeout", "--wait-timeout", dest="timeout", type=float, default=300.0, help="Wait timeout in seconds (default: 300)")
     parser.add_argument("--expect-file", "--output-file", dest="expect_file", default=None, help="Expected deliverable file path. Auto-detects completion when file settles with verdict.")
     parser.add_argument("--fast-fail-timeout", type=float, default=45.0, help="Fast fail timeout in seconds if request is not even enqueued (default: 45.0, 0 to disable)")
+    parser.add_argument("--doctor", "--check-config", dest="doctor", action="store_true", help="Diagnose local Claude Code cross-session inbound policy cascade (strictly read-only)")
     parser.add_argument("--allow-cross-project", dest="allow_cross_project", metavar="TARGET_DIR", default=None, help="Explicitly allow cross-project message delivery. Must specify target project path, e.g. --allow-cross-project=/path/to/project")
     parser.add_argument("--debug", action="store_true", help="Enable verbose debug logs")
     return parser
@@ -1093,6 +1205,19 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+
+    if args.doctor:
+        policy, src = resolve_cross_session_inbound_policy(target_cwd=os.getcwd())
+        print("=== Claude Code 跨会话入站策略只读诊断 ===")
+        print(f"当前推断生效策略: {policy}")
+        print(f"判定来源: {src}")
+        print("\n说明:")
+        print("  • parity_check (默认): 发送方与目标会话模式对齐时放行，bypass 模式会话需卡片审核。")
+        print("  • accept: 无条件接收入站消息（注意: 对 bypass 会话生效时将免确认执行）。")
+        print("  • hold: 所有入站消息均暂缓扣留待审。")
+        print("  • refuse: 拒绝所有入站跨会话消息。")
+        print("详细安全规范请参阅 SECURITY.md §6。")
+        return EXIT_SIGN_OFF
 
     if args.bind_target:
         bfile = save_project_binding("claude", args.bind_target)

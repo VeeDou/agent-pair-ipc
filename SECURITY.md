@@ -33,6 +33,13 @@ Because these agents operate with shell execution (`bash`), file read/write, and
 
 6. **Peer Envelope & Authorization Honesty**:
    - Every envelope states that a peer message is **not** user approval and does not request privilege escalation. `--user-context` only quotes what the user actually said and is labelled as unverified by the receiver. Never fabricate it.
+   - **External Mode Assertion**: External peer callers (e.g. Antigravity) strictly and honestly declare `from-mode="prompting"`. The toolkit never sniffs target process arguments or spoofs elevated execution modes (`bypass`), eliminating identity spoofing.
+   - **Inbound Gate & Parity Holds**: Claude Code 2.1+ natively implements an intentional inbound gate. Inbound peer traffic without mode parity (e.g. `prompting` callers targeting a `bypassPermissions` session) is held in memory for human attestation ("Review it below" card in the desktop UI) to prevent unprivileged scripts from quietly executing shell commands inside high-privilege sessions.
+   - **Strict Read-Only Tooling Policy**: `agent-pair-ipc` maintains a 100% read-only policy regarding user and application configuration (`settings.json`). The tool will **never** automatically write, modify, or provide a `--fix` switch to relax security gates, nor will it dispatch instructions asking peer agents to mutate user permissions.
+   - **User Security Tradeoff on `crossSessionInbound: "accept"`**:
+     > ⚠️ **Security Warning**: If you choose to configure `"crossSessionInbound": "accept"` in `~/.claude/settings.json`, this is a global user setting across all projects and sessions. It bypasses parity hold checks and directly enqueues peer messages into all sessions—including `bypassPermissions` sessions where tools run without confirmation prompts.
+     > Any local process running under your OS user account that connects to the local messaging socket will be able to dispatch commands directly into those high-privilege sessions.
+     > Only enable this setting if you fully trust all local processes and external agents operating on your workstation. Preferred alternatives include approving held cards individually or operating sessions in `auto` mode.
 
 7. **macOS GUI Automation & Accessibility (Experimental)**:
    - `open_new_gui_session()` brings the desktop app to front and clicks its native "new session" menu item (Claude: File > New Session; ChatGPT/Codex: File > New Chat), falling back to Cmd+N.

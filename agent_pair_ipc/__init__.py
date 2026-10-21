@@ -4,12 +4,13 @@ agent-pair-ipc: Zero-dependency Local IPC & Pair-Review Toolkit for AI Coding Ag
 
 from __future__ import annotations
 
-__version__ = "0.5.1"
+__version__ = "0.5.2"
 
 from agent_pair_ipc.claude import (
     get_active_sessions as get_active_claude_sessions,
     list_sessions as list_claude_sessions,
     read_latest_feedback as read_claude_feedback,
+    resolve_cross_session_inbound_policy as resolve_claude_inbound_policy,
     send_and_wait as send_and_wait_claude,
     send_file as send_file_to_claude,
     send_message_to_claude as send_to_claude,
@@ -47,6 +48,7 @@ from agent_pair_ipc.common import (
 
 __all__ = [
     "__version__",
+    "resolve_claude_inbound_policy",
     "send_to_claude",
     "send_file_to_claude",
     "send_and_wait_claude",

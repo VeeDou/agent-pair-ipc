@@ -696,6 +696,63 @@ class TestClaude(unittest.TestCase):
         self.assertNotIn("agent-pair-ipc reply", env)
         self.assertNotIn("<<'AP_REPLY_EOF'", env)
 
+    def test_resolve_cross_session_inbound_policy_cascade(self):
+        from agent_pair_ipc.claude import resolve_cross_session_inbound_policy
+        from pathlib import Path
+        import json
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            home_dir = base / "home"
+            target_repo = base / "repo"
+            managed_file = base / "managed" / "managed-settings.json"
+
+            home_dir.mkdir(parents=True)
+            target_repo.mkdir(parents=True)
+            managed_file.parent.mkdir(parents=True)
+
+            # 1. Default fallback: no settings files exist -> parity_check
+            pol, src = resolve_cross_session_inbound_policy(target_cwd=target_repo, home_dir=home_dir, managed_path=managed_file)
+            self.assertEqual(pol, "parity_check")
+            self.assertIn("未显式配置", src)
+
+            # 2. User setting: ~/.claude/settings.json sets "accept"
+            user_claude = home_dir / ".claude"
+            user_claude.mkdir()
+            (user_claude / "settings.json").write_text(json.dumps({"crossSessionInbound": "accept"}))
+            pol, src = resolve_cross_session_inbound_policy(target_cwd=target_repo, home_dir=home_dir, managed_path=managed_file)
+            self.assertEqual(pol, "accept")
+            self.assertIn("用户全局配置", src)
+
+            # 3. User local override: ~/.claude/settings.local.json overrides settings.json
+            (user_claude / "settings.local.json").write_text(json.dumps({"crossSessionInbound": "hold"}))
+            pol, src = resolve_cross_session_inbound_policy(target_cwd=target_repo, home_dir=home_dir, managed_path=managed_file)
+            self.assertEqual(pol, "hold")
+            self.assertIn("settings.local.json", src)
+
+            # 4. Repo tightening: repo .claude/settings.json sets "refuse", overrides user accept
+            (user_claude / "settings.local.json").unlink()
+            repo_claude = target_repo / ".claude"
+            repo_claude.mkdir()
+            (repo_claude / "settings.json").write_text(json.dumps({"crossSessionInbound": "refuse"}))
+            pol, src = resolve_cross_session_inbound_policy(target_cwd=target_repo, home_dir=home_dir, managed_path=managed_file)
+            self.assertEqual(pol, "refuse")
+            self.assertIn("仓库收紧配置", src)
+
+            # 5. Managed override: managed-settings.json takes absolute precedence
+            managed_file.write_text(json.dumps({"crossSessionInbound": "hold"}))
+            pol, src = resolve_cross_session_inbound_policy(target_cwd=target_repo, home_dir=home_dir, managed_path=managed_file)
+            self.assertEqual(pol, "hold")
+            self.assertIn("组织托管配置", src)
+
+            # 6. Condition C1: Unrecognized value in any layer triggers hold with invalid-setting note
+            managed_file.write_text(json.dumps({"crossSessionInbound": "UNRECOGNIZED_VAL"}))
+            pol, src = resolve_cross_session_inbound_policy(target_cwd=target_repo, home_dir=home_dir, managed_path=managed_file)
+            self.assertEqual(pol, "hold")
+            self.assertIn("未识别值", src)
+            self.assertIn("UNRECOGNIZED_VAL", src)
+
 
 if __name__ == "__main__":
     unittest.main()
