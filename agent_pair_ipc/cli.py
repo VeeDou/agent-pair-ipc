@@ -11,7 +11,7 @@ import sys
 import time
 
 from agent_pair_ipc import __version__
-from agent_pair_ipc import claude, codex
+from agent_pair_ipc import antigravity, claude, codex
 from agent_pair_ipc.common import (
     EXIT_CHANGES_REQUESTED,
     EXIT_ERROR,
@@ -130,11 +130,12 @@ def main(argv: list[str] | None = None) -> int:
         description="Zero-dependency Local IPC & Pair-Review Toolkit for Claude Code, Codex, and Antigravity.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""Subcommands:
-  claude      Interact with local active Claude Code sessions
-  codex       Interact with local active Codex sessions
-  list        List all active sessions across Claude Code and Codex
-  reply       (peer side) Answer a request over the duplex reply channel
-  inbox       (requester side) Read replies that arrived after waiting ended
+  claude       Interact with local active Claude Code sessions
+  codex        Interact with local active Codex sessions
+  antigravity  Interact with local active Antigravity Desktop sessions
+  list         List all active sessions across Claude Code, Codex, and Antigravity
+  reply        (peer side) Answer a request over the duplex reply channel
+  inbox        (requester side) Read replies that arrived after waiting ended
 
 Examples:
   agent-pair-ipc list
@@ -142,6 +143,7 @@ Examples:
   agent-pair-ipc codex -w -f - <<'AP_EOF'
   ...rich markdown with `backticks` and $VARS...
   AP_EOF
+  agent-pair-ipc antigravity -w -f ./REVIEW_REQUEST.md
   agent-pair-ipc reply --to req_0123456789ab -f answer.md
   agent-pair-ipc inbox
 """
@@ -152,11 +154,12 @@ Examples:
     for name, desc in (
         ("claude", "Interact with active Claude Code sessions."),
         ("codex", "Interact with active Codex sessions."),
+        ("antigravity", "Interact with active Antigravity Desktop sessions."),
         ("reply", "Answer a request over the duplex reply channel."),
         ("inbox", "Read peer replies stored in the mailbox."),
     ):
         subparsers.add_parser(name, add_help=False, description=desc)
-    subparsers.add_parser("list", description="List all active Claude Code and Codex sessions.")
+    subparsers.add_parser("list", description="List all active Claude Code, Codex, and Antigravity sessions.")
 
     if not argv:
         parser.print_help()
@@ -173,6 +176,9 @@ Examples:
         print("\n" + "=" * 40 + "\n")
         print("=== Codex Sessions ===")
         codex.list_sessions()
+        print("\n" + "=" * 40 + "\n")
+        print("=== Antigravity Sessions ===")
+        antigravity.list_sessions()
         return 0
 
     if first_arg == "claude":
@@ -180,6 +186,9 @@ Examples:
 
     if first_arg == "codex":
         return codex.main(argv[1:])
+
+    if first_arg == "antigravity":
+        return antigravity.main(argv[1:])
 
     if first_arg == "reply":
         return reply_main(argv[1:])

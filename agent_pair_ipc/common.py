@@ -1214,6 +1214,7 @@ class EphemeralReplyServer:
 GUI_PROFILES: dict[str, dict] = {
     "claude": {"apps": ["Claude"], "menu_items": ["New Session", "New Chat"], "key": "n"},
     "codex": {"apps": ["ChatGPT", "Codex"], "menu_items": ["New Thread", "New Chat"], "key": "n"},
+    "antigravity": {"apps": ["Antigravity"], "menu_items": ["New Conversation", "New Chat", "New Window"], "key": "n"},
 }
 
 

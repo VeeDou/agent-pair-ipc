@@ -46,6 +46,7 @@ Issues = "https://github.com/VeeDou/agent-pair-ipc/issues"
 agent-pair-ipc = "agent_pair_ipc.cli:main"
 claude-ipc = "agent_pair_ipc.claude:main"
 codex-ipc = "agent_pair_ipc.codex:main"
+antigravity-ipc = "agent_pair_ipc.antigravity:main"
 
 [tool.setuptools.packages.find]
 where = ["."]

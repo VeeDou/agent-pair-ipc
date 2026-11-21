@@ -4,7 +4,7 @@ install:
 	python3 -m pip install -e .
 
 check:
-	python3 -m py_compile agent_pair_ipc/*.py bin/agent-pair-ipc bin/claude-ipc bin/codex-ipc skills/*/scripts/*.py
+	python3 -m py_compile agent_pair_ipc/*.py bin/agent-pair-ipc bin/claude-ipc bin/codex-ipc bin/antigravity-ipc skills/*/scripts/*.py
 
 test: check
 	python3 -m unittest discover -s tests -v
