@@ -60,10 +60,11 @@ agent-pair-ipc claude -w -t 300 --expect-file docs/reports/CLAUDE_REVIEW.md -f d
 agent-pair-ipc claude -w --prefix "【Antigravity】本期全部完成，请独立复核" -f docs/reports/REVIEW_REQUEST.md
 ```
 
-### 场景 B：直接读取 Claude Code 的最新反馈（不发送新消息）
+### 场景 B：直接读取 Claude Code 的最新反馈（支持离线回退）
 ```bash
-agent-pair-ipc claude -r          # 最新 1 条结论
+agent-pair-ipc claude -r          # 最新 1 条结论（若会话已休眠，自动回退读取磁盘 .jsonl）
 agent-pair-ipc claude -r -n 3     # 最后 3 轮
+agent-pair-ipc claude -r -s 5a473c03-5704-410f-a309-0269874bd9bf  # 按持久 sessionId 离线/在线读取
 ```
 
 ### 场景 C：新工程无会话 —— GUI 原生新建，IPC 随后挂载
@@ -72,11 +73,11 @@ agent-pair-ipc claude -r -n 3     # 最后 3 轮
 # -g：自动激活 Claude Desktop 并点击 File > New Session（需 macOS 辅助功能权限）
 agent-pair-ipc claude --await-new-session -g --await-timeout 180 -w -f docs/reports/REVIEW_REQUEST.md
 ```
-用户在桌面端新建会话并选择本工程目录后，工具会识别新会话（仅接受快照之后诞生的会话），自动写入 `.agent-pair/bindings.json` 并投递。在其他目录新建的会话会被提示而不会被误绑。
+用户在桌面端新建会话（或点击已有休眠会话唤醒）并选择本工程目录后，工具会识别会话（仅接受快照之后诞生的活跃进程），自动将**持久 `sessionId`** 写入 `.agent-pair/bindings.json` 并投递。在其他目录新建的会话会被提示而不会被误绑。
 
 ### 场景 D：会话绑定管理
 ```bash
-claude-ipc --bind local_bec81a52-3f90-4199-a1ac-ed3b3290588d   # 显式绑定
+claude-ipc --bind 5a473c03-5704-410f-a309-0269874bd9bf          # 显式绑定（传 PID/标题/hostSessionId 会自动解析为持久 sessionId）
 claude-ipc --unbind                                             # 解除绑定
 claude-ipc -w --pick-latest -f docs/reports/REVIEW_REQUEST.md   # 多会话时使用最新一条
 ```
@@ -157,8 +158,9 @@ agent-pair-ipc claude -l
 - `1` (`EXIT_ERROR`)：执行错误、进程崩溃（`PROCESS_TERMINATED`）、Socket 消失（`SOCKET_DISAPPEARED`）或常规超时。
 - `2` (`EXIT_CHANGES_REQUESTED`)：复核退回，最终行为 `VERDICT: CHANGES_REQUESTED`。
 - `3` (`EXIT_NO_VERDICT`)：对方完成回答但未包含格式化 VERDICT 行。
-- `4` (`EXIT_QUEUED_UNCONSUMED`)：请求在 `fast_fail_timeout` 内未能确认进入对端队列（窗口后台休眠或未获焦点，可切换窗口激活，并可通过 `agent-pair-ipc inbox <Req-ID>` 取件）。
+- `4` (`EXIT_QUEUED_UNCONSUMED`)：请求在 `fast_fail_timeout` 内未能确认进入对端队列（入站扣留待审或目标会话挂起；可用 `--doctor` 诊断策略、传 `-g` 在 8s 未入队时自动将桌面端切前台查看卡片，或稍后用 `-r` / `agent-pair-ipc inbox <Req-ID>` 取件）。
 - `5` (`EXIT_NEEDS_NEW_THREAD`)：新工程无会话且运行于非交互环境，提示用户新建会话或改用 `--await-new-session`。
+- `6` (`EXIT_NEEDS_USER_INPUT`)：目标会话调用 `AskUserQuestion` 或进入 `waiting`（`waitingFor: "input needed"`）等待用户点选；stdout 已输出格式化的问题与选项，提示用户去桌面端作答后再用 `-r` 获取最终结论。
 
 ---
 
@@ -173,17 +175,18 @@ agent-pair-ipc claude -l
 | `-f`, `--file` | 读取文件作为消息；`-f -` 读取 stdin（推荐配合 `<<'AP_EOF'`） | `-f report.md` |
 | `-m`, `--msg` | 短文本内联（富文本请改用 `-f`） | `-m "请复核"` |
 | `--prefix` | 在文件或 stdin 内容前拼接提示前缀 | `--prefix "【提示】"` |
-| `-s`, `--session` | 指定目标会话 PID / 名称 / Session ID | `-s local_bec81a52...` |
-| `--bind` / `--unbind` | 写入 / 移除 `.agent-pair/bindings.json` 中的绑定 | `--bind <id>` |
+| `-s`, `--session` | 指定目标会话持久 `sessionId` / 标题 / hostSessionId / PID | `-s 5a473c03-...` |
+| `--bind` / `--unbind` | 写入（自动解析为持久 `sessionId`） / 移除 `.agent-pair/bindings.json` 绑定 | `--bind <id\|title\|pid>` |
 | `--pick-latest` | 当前目录有多个会话时选最近活跃的一条 | `--pick-latest` |
-| `--await-new-session` | 显式等待新会话，捕获后自动绑定并发送（非 TTY 亦可） | `--await-new-session` |
+| `--await-new-session` | 显式等待新会话或休眠会话唤醒，捕获后自动绑定持久 `sessionId` 并发送 | `--await-new-session` |
 | `--await-timeout` | 等待新会话的秒数（默认 120） | `--await-timeout 180` |
 | `--no-auto-new` | 禁用无会话时的自动等待感应 | `--no-auto-new` |
-| `-g`, `--activate-gui` | 唤醒 Claude Desktop 并触发 File > New Session | `-g` |
+| `-g`, `--activate-gui` | 将 Claude Desktop 切至前台（配合 `--await-new-session` 触发新建；配合 `-w` 在 8s 未入队时切前台便于审核待批卡片） | `-g` |
+| `--doctor` | 只读诊断当前目录生效的 `crossSessionInbound` 策略级联与配置指引 | `--doctor` |
 | `--intent` | 对等意图声明（Read-Only Review / Edit and Fix / Notification …） | `--intent "Notification"` |
 | `--user-context` | 如实引用用户原话作为授权上下文 | `--user-context "把这个拿给Claude code审核"` |
 | `--sender` | 信封中的发送方名称（默认 `$AGENT_PAIR_SENDER` 或自动识别） | `--sender Antigravity` |
-| `-r`, `--read` / `-n` / `-a` | 读取最新回复 / 条数 / 含中间工具轮次 | `-r -n 3` |
-| `-l`, `--list` | 列出活跃会话、状态、socket 与转录路径 | `-l` |
+| `-r`, `--read` / `-n` / `-a` | 读取最新回复（无活跃 Socket 时自动离线回退读取 `.jsonl`；支持感知待选 `AskUserQuestion`） | `-r -n 3` |
+| `-l`, `--list` | 列出活跃会话（优先展示持久 `sessionId`）及当前工程最近休眠会话 | `-l` |
 
 脚本入口：`agent-pair-ipc claude ...`、`claude-ipc ...`，或本 Skill 内的 `python3 scripts/claude_code_ipc.py ...`（三者等价）。

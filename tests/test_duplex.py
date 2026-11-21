@@ -285,9 +285,9 @@ class TestProjectSessionAwareness(unittest.TestCase):
                  patch("sys.stderr.isatty", return_value=False), \
                  redirect_stderr(err):
                 res = await_new_session(timeout=30.0, cwd=proj, require_tty=False)
-            self.assertEqual(res["host_session_id"], "local_mine")
-            mock_save.assert_called_once_with("claude", "local_mine", cwd=proj)
-            self.assertIn("claude-ipc --bind local_foreign", err.getvalue())
+            self.assertEqual(res["session_id"], "s-mine")
+            mock_save.assert_called_once_with("claude", "s-mine", cwd=proj)
+            self.assertIn("claude-ipc --bind s-foreign", err.getvalue())
 
     def test_gui_activation_clicks_new_session_menu_before_keystroke(self):
         from agent_pair_ipc.common import open_new_gui_session

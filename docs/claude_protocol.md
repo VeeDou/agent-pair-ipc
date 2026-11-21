@@ -9,12 +9,13 @@ Claude Code running locally (CLI or Desktop app) listens on a Unix Domain Socket
 - **Session Metadata Directory**: `~/.claude/sessions/`
 - **Session JSON**: `~/.claude/sessions/<pid>.json`
   - `pid`: Process ID (e.g. `22286`)
-  - `sessionId`: Internal Claude UUID (e.g. `11223344-5566-7788-99aa-bbccddeeff00`)
-  - `hostSessionId`: Host / UI display session ID (e.g. `local_12345678-abcd-ef01-2345-6789abcdef01`)
+  - `sessionId`: Persistent Claude UUID (e.g. `11223344-5566-7788-99aa-bbccddeeff00`) — survives hibernation and wake-up; preferred for `.agent-pair/bindings.json`
+  - `hostSessionId`: Ephemeral host / UI session ID (e.g. `local_12345678-abcd-ef01-2345-6789abcdef01`) — regenerates when Claude Desktop wakes a hibernated session
   - `name`: Session title (e.g. `Architecture-Refactor-Design`)
   - `cwd`: Project working directory
   - `kind`: Session mode (`interactive`, `bg`, etc.)
   - `entrypoint`: Application type (`claude-desktop`, `cli`)
+  - `status` / `waitingFor`: Live state (`idle` / `busy` / `waiting`, with `waitingFor: "input needed"` when paused on `AskUserQuestion`)
   - `messagingSocketPath`: Socket URI (e.g. `/tmp/cc-socks/22286.sock`)
 - **Peer Authentication Token**: `~/.claude/sessions/<pid>.<hash>.key`
   - Format: `{"peerToken": "3587be69..."}`
@@ -47,9 +48,14 @@ Claude Code records JSONL transcripts under:
 
 When waiting for a response (`-w` mode):
 - **Live Tool Tracking**: Detects assistant messages where `content` contains `{"type": "tool_use", "name": "..."}`.
+- **Interactive Input Detection**: Detects unanswered `AskUserQuestion` `tool_use` turns (as well as `status == "waiting"` + `waitingFor == "input needed"` in `~/.claude/sessions/<pid>.json`), formats the question and options, and exits immediately with code `6` (`EXIT_NEEDS_USER_INPUT`).
 - **Completion Detection**: Waits for an assistant turn where `stop_reason != "tool_use"` (typically `"end_turn"`).
-- Extracts clean final text without intermediate tool payloads.
+- Extracts clean final text without intermediate tool payloads or `api-request-blob` entries.
 - The transcript is the **fallback** channel. A reply arriving on the duplex reply socket or mailbox wins.
+
+When reading (`-r` mode) or listing (`-l` mode):
+- If a session has hibernated (no `~/.claude/sessions/<pid>.json` or socket), `-r` automatically falls back to scanning `~/.claude/projects/*/*.jsonl` by `sessionId`, `.agent-pair/bindings.json`, or `custom-title`.
+- `-l` displays active sessions (prioritizing persistent `sessionId`) alongside recent hibernated sessions for the current project.
 
 ## 5. New sessions (GUI-native creation)
 
