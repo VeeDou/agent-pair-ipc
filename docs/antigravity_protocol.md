@@ -38,6 +38,14 @@ yet implement a separate Desktop trajectory-loading RPC.
 
 `connect: operation not permitted` indicates the calling environment cannot
 connect to the local service; it does not establish whether Desktop accepts the
-conversation. On 2026-11-20 discovery of the test session succeeded, but the
-managed execution environment blocked localhost RPCs, so actual delivery and
-reply receipt remain unverified.
+conversation.
+
+## Verification status
+
+- **2026-11-22 (live round-trip verified)**: From Claude Code (`agent-pair-ipc`
+  `0.5.3`) running in a local repository with localhost access,
+  `agent-pair-ipc antigravity -l` discovered the active Antigravity Desktop
+  conversation (`[Current Project]`), and `agent-pair-ipc antigravity -w`
+  delivered the correlated Peer Envelope via `agentapi send-message`, tracked
+  the matching request nonce in `transcript.jsonl`, and returned the final
+  `VERDICT: SIGN_OFF` response with exit code `0`.

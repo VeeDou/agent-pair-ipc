@@ -11,15 +11,23 @@ test: check
 	./bin/agent-pair-ipc --version
 	./bin/agent-pair-ipc list
 
-# Point every agent's skill dir at this repo. A pre-existing real directory (stale copy) is moved to
-# ~/.agent-pair/backups/ first; plain `ln -sfn` would otherwise nest the link *inside* that directory.
-SKILL_TARGETS := $(HOME)/.agents/skills $(HOME)/.gemini/config/skills
+# Point every agent's skill dir at the peer skills it calls in this repo.
+# A pre-existing real directory (stale copy) is moved to ~/.agent-pair/backups/ first;
+# plain `ln -sfn` would otherwise nest the link *inside* that directory.
 SKILL_BACKUP_DIR := $(HOME)/.agent-pair/backups/skills-$(shell date +%Y%m%d%H%M%S)
+SKILL_LINK_SPECS := \
+	$(HOME)/.gemini/config/skills:claude-code-ipc,codex-ipc \
+	$(HOME)/.claude/skills:antigravity-ipc,codex-ipc \
+	$(HOME)/.agents/skills:claude-code-ipc,codex-ipc,antigravity-ipc
 
 link-skills:
-	@for dir in $(SKILL_TARGETS); do \
+	@for spec in $(SKILL_LINK_SPECS); do \
+		dir="$${spec%%:*}"; \
+		skills="$${spec#*:}"; \
 		mkdir -p "$$dir"; \
-		for skill in claude-code-ipc codex-ipc; do \
+		old_ifs="$$IFS"; IFS=","; \
+		for skill in $$skills; do \
+			IFS="$$old_ifs"; \
 			dest="$$dir/$$skill"; \
 			if [ -e "$$dest" ] && [ ! -L "$$dest" ]; then \
 				backup="$(SKILL_BACKUP_DIR)/$$(basename $$(dirname $$dir) | sed 's/^\.//')"; \
@@ -30,6 +38,7 @@ link-skills:
 			ln -sfn "$(CURDIR)/skills/$$skill" "$$dest"; \
 			echo "Linked $$dest -> $(CURDIR)/skills/$$skill"; \
 		done; \
+		IFS="$$old_ifs"; \
 	done
 
 clean:

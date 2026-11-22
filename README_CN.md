@@ -116,8 +116,9 @@ codex-ipc -w -f ./templates/REVIEW_REQUEST.md
 make link-skills
 ```
 
-把 `~/.agents/skills/{claude-code-ipc,codex-ipc}` 与 `~/.gemini/config/skills/...` 软链接到本仓库，
-任何项目目录调用的都是同一套 IPC 引擎；Skill 内 `scripts/*.py` 旧路径保留为薄 shim 继续可用。
+把 `~/.gemini/config/skills/{claude-code-ipc,codex-ipc}`、`~/.claude/skills/{antigravity-ipc,codex-ipc}`
+与 `~/.agents/skills/{claude-code-ipc,codex-ipc,antigravity-ipc}` 软链接到本仓库，
+任何 Agent 与项目目录调用的都是同一套 IPC 引擎；Skill 内 `scripts/*.py` 旧路径保留为薄 shim 继续可用。
 若目标位置是旧版实体目录，会先备份到 `~/.agent-pair/backups/`。
 
 ---

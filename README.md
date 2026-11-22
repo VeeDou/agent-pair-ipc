@@ -113,8 +113,9 @@ codex-ipc -w -f ./templates/REVIEW_REQUEST.md
 make link-skills
 ```
 
-This symlinks `~/.agents/skills/{claude-code-ipc,codex-ipc}` and `~/.gemini/config/skills/...` to this repo,
-so every project uses the same engine. The skills' `scripts/*.py` paths keep working as thin shims.
+This symlinks `~/.gemini/config/skills/{claude-code-ipc,codex-ipc}`, `~/.claude/skills/{antigravity-ipc,codex-ipc}`,
+and `~/.agents/skills/{claude-code-ipc,codex-ipc,antigravity-ipc}` to this repo,
+so every agent and project uses the same engine. The skills' `scripts/*.py` paths keep working as thin shims.
 Stale copies that are real directories are moved to `~/.agent-pair/backups/` first.
 
 ---
