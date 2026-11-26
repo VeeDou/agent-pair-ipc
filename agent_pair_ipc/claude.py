@@ -11,10 +11,13 @@ import argparse
 import json
 import os
 import re
+import select
 import socket
+import stat
 import subprocess
 import sys
 import time
+import uuid
 from pathlib import Path
 
 from agent_pair_ipc.common import (
@@ -53,6 +56,119 @@ from agent_pair_ipc.common import (
 DEFAULT_AWAIT_TIMEOUT = 120.0
 _IDLE_WARN_SECONDS = 8.0
 _WAITING_FLUSH_GRACE_SECONDS = 1.5
+_NON_WAIT_RECEIPT_GRACE_SECONDS = 0.4
+_RECEIPT_MAX_BYTES = 65536
+_HOST_SESSION_ID_RE = re.compile(r"^[A-Za-z0-9_-]{4,128}$")
+
+
+def _default_desktop_sessions_root() -> Path:
+    if sys.platform == "darwin":
+        return Path.home() / "Library" / "Application Support" / "Claude" / "claude-code-sessions"
+    return Path.home() / ".config" / "Claude" / "claude-code-sessions"
+
+
+def _extract_last_transcript_permission_mode(
+    jsonl_path: Path,
+    tail_bytes: int = 262144,
+    max_tail_bytes: int = 1048576,
+) -> str | None:
+    """Read the latest permissionMode from a Claude Code JSONL transcript (bounded tail-first, read-only)."""
+    try:
+        size = jsonl_path.stat().st_size
+    except OSError:
+        return None
+    if size <= 0:
+        return None
+
+    def last_mode_in_lines(lines) -> str | None:
+        latest: str | None = None
+        for line in lines:
+            if not line or b'"permissionMode"' not in line:
+                continue
+            try:
+                obj = json.loads(line.decode("utf-8", errors="replace"))
+            except Exception:
+                continue
+            if isinstance(obj, dict):
+                pm = obj.get("permissionMode")
+                if isinstance(pm, str) and pm.strip():
+                    latest = pm.strip()
+        return latest
+
+    try:
+        with open(jsonl_path, "rb") as f:
+            if size <= tail_bytes:
+                return last_mode_in_lines(f.read().splitlines())
+            f.seek(size - tail_bytes)
+            tail_lines = f.read(tail_bytes).splitlines()
+            if len(tail_lines) > 1:
+                found = last_mode_in_lines(tail_lines[1:])
+                if found:
+                    return found
+            if max_tail_bytes > tail_bytes:
+                read_len = min(size, max_tail_bytes)
+                f.seek(size - read_len)
+                wider_lines = f.read(read_len).splitlines()
+                lines_to_scan = wider_lines if size <= max_tail_bytes else wider_lines[1:]
+                return last_mode_in_lines(lines_to_scan)
+            return None
+    except OSError:
+        return None
+
+
+def detect_session_permission_mode(
+    session: dict,
+    desktop_sessions_root: Path | None = None,
+) -> tuple[str | None, str]:
+    """
+    Strictly read-only detection of the target Claude Code session's current permissionMode.
+    Priority:
+      1. Live Claude Desktop local session JSON (<hostSessionId>.json) — updates immediately on UI mode switch.
+      2. JSONL transcript tail (`permissionMode` field on user turns).
+      3. Pre-populated `session["permission_mode"]` metadata (if any).
+    """
+    host_sid = str(session.get("host_session_id") or "").strip()
+    target_sid = str(session.get("session_id") or "").strip()
+    if host_sid and _HOST_SESSION_ID_RE.match(host_sid):
+        root = desktop_sessions_root or _default_desktop_sessions_root()
+        try:
+            if root.is_dir():
+                matches = []
+                for p in root.glob(f"*/*/{host_sid}.json"):
+                    if not p.is_file():
+                        continue
+                    try:
+                        mtime = p.stat().st_mtime
+                        with open(p, "r", encoding="utf-8") as f:
+                            data = json.load(f)
+                    except Exception:
+                        continue
+                    if not isinstance(data, dict):
+                        continue
+                    pm = data.get("permissionMode")
+                    if not (isinstance(pm, str) and pm.strip()):
+                        continue
+                    cli_match = bool(target_sid and data.get("cliSessionId") == target_sid)
+                    matches.append((cli_match, mtime, pm.strip()))
+                if matches:
+                    matches.sort(key=lambda item: (item[0], item[1]), reverse=True)
+                    return matches[0][2], "desktop_session"
+        except Exception:
+            pass
+
+    transcript_path = session.get("transcript_path")
+    if transcript_path:
+        p_tr = Path(transcript_path)
+        if p_tr.is_file():
+            pm = _extract_last_transcript_permission_mode(p_tr)
+            if pm:
+                return pm, "transcript"
+
+    raw_pm = session.get("permission_mode")
+    if isinstance(raw_pm, str) and raw_pm.strip():
+        return raw_pm.strip(), "session"
+
+    return None, ""
 
 
 def _preferred_session_id(session: dict) -> str:
@@ -1057,12 +1173,20 @@ def resolve_cross_session_inbound_policy(
     return "parity_check", "未显式配置 crossSessionInbound (默认按模式对齐判定)"
 
 
-def _format_inbound_guidance(policy: str, policy_src: str, include_summary: bool = True) -> list[str]:
+def _format_inbound_guidance(
+    policy: str,
+    policy_src: str,
+    include_summary: bool = True,
+    entrypoint: str = "",
+    permission_mode: str | None = None,
+) -> list[str]:
     """
     Build strictly read-only, policy-specific configuration & recovery guidance
-    respecting the SECURITY.md §6 safety hierarchy.
+    respecting the SECURITY.md §6 safety hierarchy and Desktop vs CLI UI differences.
     """
     lines = [f"  • 当前推断生效的入站配置: [策略: {policy}] (来源: {policy_src})"] if include_summary else []
+    if permission_mode and include_summary:
+        lines.append(f"  • 目标会话当前权限模式: {permission_mode}")
     if "未识别值" in policy_src:
         lines.append("  • [修复非法值] 配置文件中的 crossSessionInbound 取值无效（合法值为 accept / hold / refuse），修正前所有入站消息会被扣留。")
         return lines
@@ -1075,7 +1199,10 @@ def _format_inbound_guidance(policy: str, policy_src: str, include_summary: bool
         else:
             lines.append("  • [用户配置] 请检查 ~/.claude/settings.local.json 或 ~/.claude/settings.json 中的 crossSessionInbound 字段。")
         if policy == "hold":
-            lines.append("  • [首选] 切换到 Claude Desktop 目标会话，查看聊天底部「待审核卡片」（Review it below）并点击批准。")
+            if entrypoint == "claude-desktop":
+                lines.append("  • [Claude Desktop 说明] 桌面端运行于 headless 模式，界面无「待审核卡片」UI；暂留消息将在 5 分钟后过期，需调整上述配置或改用 CLI 端会话。")
+            else:
+                lines.append("  • [首选] 切换到 Claude Code 目标会话，查看底部「待审核卡片」（Review it below）并点击批准。")
         return lines
 
     if policy == "accept":
@@ -1083,13 +1210,281 @@ def _format_inbound_guidance(policy: str, policy_src: str, include_summary: bool
         return lines
 
     # Default: parity_check
-    lines.extend([
-        "  1. [首选] 请在 Claude Desktop 中切换到该会话，查看聊天记录底部是否有「待审核卡片」（Review it below），点击批准即可放行（发送时加 `-g` 可在 8s 未入队时自动将 Claude Desktop 切至前台便于查看）；",
-        "  2. [推荐] 建议目标会话使用默认交互模式或 auto 模式（已观察到与外部 Agent 的 prompting 模式对齐时可直达；bypassPermissions 会话默认触发扣留审核）；",
-        "  3. [全局放行·需自行权衡] Claude Code 的仓库级 `.claude/settings.json` 仅可收紧（hold/refuse）不可单项目放行；仅当你完全信任本机所有同用户进程时，可手动在 `~/.claude/settings.json`（或 `~/.claude/settings.local.json`）加入 `\"crossSessionInbound\": \"accept\"`（⚠️ 全局生效，将跳过含 bypassPermissions 在内所有会话的入站审核；本工具只读不代写）；",
-        "  4. 了解更多跨 Agent 自动化配置与安全风险，请查阅 SECURITY.md §6。",
-    ])
+    if entrypoint == "claude-desktop":
+        if permission_mode and permission_mode != "bypassPermissions":
+            lines.extend([
+                f"  1. [Claude Desktop 说明] 目标会话当前探测模式为 `{permission_mode}`（非 `bypassPermissions`），且桌面端界面无「待审核卡片」UI；若仍未入队，请检查会话是否正在忙碌/等待输入，或核对 `--setting-sources` / 尝试切换一次模式（勿重复重发）；",
+                "  2. [全局放行·需自行权衡] Claude Code 的仓库级 `.claude/settings.json` 仅可收紧（hold/refuse）不可单项目放行；仅当你完全信任本机所有同用户进程时，可手动在 `~/.claude/settings.json`（或 `~/.claude/settings.local.json`）加入 `\"crossSessionInbound\": \"accept\"`（⚠️ 全局生效，将跳过含 bypassPermissions 在内所有会话的入站审核；本工具只读不代写）；",
+                "  3. 了解更多跨 Agent 自动化配置与安全风险，请查阅 SECURITY.md §6。",
+            ])
+        else:
+            lines.extend([
+                "  1. [首选·Claude Desktop] Claude Desktop 运行于 headless 模式，界面无「待审核卡片」UI，暂留消息将在 5 分钟后自动过期；请将目标会话左下角权限模式从 `bypassPermissions` 切为 `Auto` / `Default` / `Accept Edits`（5 分钟内切换会自动放行暂留消息，请勿重复重发）；",
+                "  2. [全局放行·需自行权衡] Claude Code 的仓库级 `.claude/settings.json` 仅可收紧（hold/refuse）不可单项目放行；仅当你完全信任本机所有同用户进程时，可手动在 `~/.claude/settings.json`（或 `~/.claude/settings.local.json`）加入 `\"crossSessionInbound\": \"accept\"`（⚠️ 全局生效，将跳过含 bypassPermissions 在内所有会话的入站审核；本工具只读不代写）；",
+                "  3. 了解更多跨 Agent 自动化配置与安全风险，请查阅 SECURITY.md §6。",
+            ])
+    elif entrypoint == "cli":
+        lines.extend([
+            "  1. [首选·Claude Code CLI] 请在终端底部查看「待审核卡片」（Review it below），点击批准即可放行；",
+            "  2. [推荐] 建议目标会话使用默认交互模式或 auto 模式（已观察到与外部 Agent 的 prompting 模式对齐时可直达；bypassPermissions 会话默认触发扣留审核）；",
+            "  3. [全局放行·需自行权衡] Claude Code 的仓库级 `.claude/settings.json` 仅可收紧（hold/refuse）不可单项目放行；仅当你完全信任本机所有同用户进程时，可手动在 `~/.claude/settings.json`（或 `~/.claude/settings.local.json`）加入 `\"crossSessionInbound\": \"accept\"`（⚠️ 全局生效，将跳过含 bypassPermissions 在内所有会话的入站审核；本工具只读不代写）；",
+            "  4. 了解更多跨 Agent 自动化配置与安全风险，请查阅 SECURITY.md §6。",
+        ])
+    else:
+        lines.extend([
+            "  1. [首选·按端侧区分] Claude Desktop 无「待审核卡片」UI（暂留消息 5 分钟自动过期），请将目标会话从 `bypassPermissions` 切为 `Auto` / `Default` / `Accept Edits`；Claude Code CLI（终端）请在底部查看「待审核卡片」（Review it below）并点击批准放行；",
+            "  2. [推荐] 建议目标会话使用默认交互模式或 auto 模式（已观察到与外部 Agent 的 prompting 模式对齐时可直达；bypassPermissions 会话默认触发扣留审核）；",
+            "  3. [全局放行·需自行权衡] Claude Code 的仓库级 `.claude/settings.json` 仅可收紧（hold/refuse）不可单项目放行；仅当你完全信任本机所有同用户进程时，可手动在 `~/.claude/settings.json`（或 `~/.claude/settings.local.json`）加入 `\"crossSessionInbound\": \"accept\"`（⚠️ 全局生效，将跳过含 bypassPermissions 在内所有会话的入站审核；本工具只读不代写）；",
+            "  4. 了解更多跨 Agent 自动化配置与安全风险，请查阅 SECURITY.md §6。",
+        ])
     return lines
+
+
+def _format_receipt_event(
+    receipt: dict,
+    nonce: str,
+    entrypoint: str,
+    session_name: str,
+    target_sid: str,
+    policy: str | None = None,
+    policy_src: str | None = None,
+    permission_mode: str | None = None,
+) -> list[str]:
+    """Format native Claude Code `peer_message_status` receipt events for stderr."""
+    status = str(receipt.get("status") or "").lower()
+    reason = str(receipt.get("reason") or "").strip()
+    drop_reason = str(receipt.get("drop_reason") or "").strip()
+    sess_label = session_name or target_sid
+
+    if status == "held":
+        lines = [
+            f"[Claude Code IPC] Delivery status: HELD (Req-ID: {nonce}) — 对端入站网关已暂留该消息，请勿重复重发。",
+        ]
+        if entrypoint == "claude-desktop":
+            if policy == "hold" or (policy_src and "未识别值" in policy_src):
+                lines.append(
+                    f"[Claude Code IPC] 提示: Claude Desktop 无「待审核卡片」UI，暂留消息将在 5 分钟后过期。"
+                    f"当前暂留由配置 ({policy_src or 'crossSessionInbound=hold'}) 触发，切换权限模式无法放行，需调整入站配置或改用 CLI 端会话。"
+                )
+            elif permission_mode and permission_mode != "bypassPermissions":
+                lines.append(
+                    f"[Claude Code IPC] 提示: Claude Desktop 无「待审核卡片」UI，暂留消息将在 5 分钟后过期。"
+                    f"目标会话当前探测模式为 {permission_mode}，请运行 `--doctor` 排查是否受配置或会话模式切换过程影响。"
+                )
+            else:
+                lines.append(
+                    f"[Claude Code IPC] 提示: Claude Desktop 无「待审核卡片」UI，暂留消息将在 5 分钟后自动过期。"
+                    f"请在桌面端会话 \"{sess_label}\" 将左下角权限模式从 bypassPermissions 切为 Auto / Default / Accept Edits（5 分钟内切换会自动放行该消息）。"
+                )
+        else:
+            lines.append(
+                f"[Claude Code IPC] 提示: 请在目标会话 \"{sess_label}\" 底部查看「待审核卡片」（Review it below）并点击批准放行。"
+            )
+        return lines
+
+    if status == "delivered":
+        return [
+            f"[Claude Code IPC] Delivery status: DELIVERED (Req-ID: {nonce}) — 此前暂留的消息已获放行并进入工作队列。"
+        ]
+
+    if status in ("refused", "dropped", "denied", "expired"):
+        detail = ""
+        if status == "refused" and policy and policy_src:
+            detail = f" (推断策略: {policy}, 来源: {policy_src})"
+        elif status == "dropped" and drop_reason:
+            detail = f" (drop_reason: {drop_reason})"
+        elif reason:
+            detail = f" ({reason})"
+        lines = [
+            f"[Claude Code IPC] Delivery status: {status.upper()} (Req-ID: {nonce}){detail}",
+            f"[Claude Code IPC] 确认该消息未进入目标会话 \"{sess_label}\" 工作队列；排除原因后可安全重发。",
+        ]
+        if status == "refused" and policy and policy_src:
+            lines.extend(_format_inbound_guidance(policy, policy_src, include_summary=False, entrypoint=entrypoint))
+        return lines
+
+    suffix = f" ({reason})" if reason else ""
+    return [f"[Claude Code IPC] Delivery status: {status.upper()} (Req-ID: {nonce}){suffix}"]
+
+
+class PeerReceiptListener:
+    """
+    Ephemeral same-directory Unix Domain Socket listener for Claude Code 2.1+
+    native `peer_message_status` reverse receipts (`held`, `delivered`, `refused`,
+    `dropped`, `denied`, `expired`).
+
+    Claude Code's UDS vetting (`r9i`) requires the reply address to live in the
+    exact same lexical directory as `messagingSocketPath` (e.g. `/tmp/cc-socks`
+    without resolving `/tmp` -> `/private/tmp`) and verifies peer PID/UID.
+    """
+
+    def __init__(self, target_socket_path: str, msg_uuid: str | None = None):
+        self.target_socket_path = target_socket_path
+        self.msg_uuid = msg_uuid or str(uuid.uuid4())
+        self.socket_path: str | None = None
+        self.server_sock: socket.socket | None = None
+        self._closed = False
+
+    @property
+    def from_address(self) -> str | None:
+        return f"uds:{self.socket_path}" if self.socket_path else None
+
+    def start(self) -> str | None:
+        if os.name == "nt" or not hasattr(socket, "AF_UNIX") or not self.target_socket_path:
+            return None
+        # Keep lexical dirname so /tmp/cc-socks matches Claude Code's same-dir vetting.
+        sock_dir = os.path.dirname(self.target_socket_path)
+        if not sock_dir:
+            return None
+        try:
+            st = os.lstat(sock_dir)
+        except OSError:
+            return None
+        if not stat.S_ISDIR(st.st_mode):
+            return None
+        if hasattr(os, "getuid") and st.st_uid != os.getuid():
+            return None
+        if (st.st_mode & 0o002) != 0:
+            return None
+
+        cand = os.path.join(sock_dir, f"ap-{os.getpid()}-{uuid.uuid4().hex[:8]}.sock")
+        if len(cand.encode("utf-8")) > 103:
+            return None
+
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        bound = False
+        try:
+            old_umask = os.umask(0o177)
+            try:
+                sock.bind(cand)
+                bound = True
+            finally:
+                os.umask(old_umask)
+            os.chmod(cand, 0o600)
+            sock.listen(8)
+            sock.setblocking(False)
+            self.socket_path = cand
+            self.server_sock = sock
+            self._closed = False
+            return cand
+        except OSError:
+            try:
+                sock.close()
+            except Exception:
+                pass
+            if bound:
+                try:
+                    os.unlink(cand)
+                except Exception:
+                    pass
+            return None
+
+    def _read_client_frames(self, conn: socket.socket) -> list[dict]:
+        buf = bytearray()
+        deadline = time.monotonic() + 0.5
+        saw_newline = False
+        while len(buf) < _RECEIPT_MAX_BYTES:
+            rem = deadline - time.monotonic()
+            if rem <= 0:
+                break
+            try:
+                # Avoid blocking for Claude Code's 150ms macOS close delay once a full NDJSON line arrives.
+                conn.settimeout(min(0.05, rem) if saw_newline else min(0.5, rem))
+                chunk = conn.recv(min(4096, _RECEIPT_MAX_BYTES - len(buf)))
+            except (socket.timeout, TimeoutError, BlockingIOError, OSError):
+                break
+            if not chunk:
+                break
+            buf.extend(chunk)
+            if b"\n" in chunk:
+                saw_newline = True
+
+        frames: list[dict] = []
+        for raw_line in bytes(buf).decode("utf-8", errors="replace").splitlines():
+            line = raw_line.strip()
+            if not line:
+                continue
+            try:
+                d = json.loads(line)
+            except Exception:
+                continue
+            if not isinstance(d, dict):
+                continue
+            if d.get("type") != "control" or d.get("action") != "peer_message_status":
+                continue
+
+            raw_status = str(d.get("status") or "").strip().lower()
+            detail = str(d.get("status_detail") or "").strip().lower()
+            eff_status = "refused" if (raw_status == "expired" and detail == "refused") else raw_status
+            if not eff_status:
+                continue
+
+            orig_id = d.get("orig_msg_id")
+            dropped_ids = d.get("dropped_msg_ids")
+            if orig_id is not None:
+                if orig_id != self.msg_uuid and not (
+                    eff_status == "dropped" and isinstance(dropped_ids, list) and self.msg_uuid in dropped_ids
+                ):
+                    continue
+            elif isinstance(dropped_ids, list) and len(dropped_ids) > 0:
+                if not (eff_status == "dropped" and self.msg_uuid in dropped_ids):
+                    continue
+            else:
+                continue
+
+            frames.append({
+                "status": eff_status,
+                "reason": str(d.get("reason") or ""),
+                "drop_reason": str(d.get("drop_reason") or ""),
+            })
+        return frames
+
+    def poll(self, timeout: float = 0.0) -> list[dict]:
+        if self.server_sock is None or self._closed:
+            return []
+        new_receipts: list[dict] = []
+        deadline = time.monotonic() + max(0.0, timeout)
+        while True:
+            rem = max(0.0, deadline - time.monotonic())
+            try:
+                readable, _, _ = select.select([self.server_sock], [], [], rem)
+            except (OSError, ValueError):
+                break
+            if readable:
+                while True:
+                    try:
+                        conn, _ = self.server_sock.accept()
+                    except (BlockingIOError, OSError):
+                        break
+                    try:
+                        new_receipts.extend(self._read_client_frames(conn))
+                    finally:
+                        try:
+                            conn.close()
+                        except Exception:
+                            pass
+                if new_receipts:
+                    break
+            if timeout <= 0 or time.monotonic() >= deadline:
+                break
+        return new_receipts
+
+    def close(self) -> None:
+        self._closed = True
+        sock = self.server_sock
+        self.server_sock = None
+        if sock is not None:
+            try:
+                sock.close()
+            except Exception:
+                pass
+        sp = self.socket_path
+        self.socket_path = None
+        if sp:
+            try:
+                os.unlink(sp)
+            except Exception:
+                pass
 
 
 def wrap_cross_session_xml(content: str, sender: str = "ext:Antigravity", mode: str = "prompting") -> str:
@@ -1107,7 +1502,7 @@ def wrap_cross_session_xml(content: str, sender: str = "ext:Antigravity", mode: 
     if not clean_sender.startswith("ext:"):
         clean_sender = f"ext:{clean_sender}"
     clean_mode = "prompting"
-    escaped = content.replace("</cross-session-message>", "<\\/cross-session-message>")
+    escaped = re.sub(r"</(\s*cross-session-message)", r"<\\/\1", content, flags=re.IGNORECASE)
     return f'<cross-session-message from="{clean_sender}" from-name="{clean_sender}" from-mode="{clean_mode}">\n{escaped}\n</cross-session-message>'
 
 
@@ -1125,6 +1520,7 @@ def send_message_to_claude(
     await_timeout: float = DEFAULT_AWAIT_TIMEOUT,
     allow_cross_project: bool | str = False,
     debug: bool = False,
+    receipt_listener: PeerReceiptListener | None = None,
 ) -> bool:
     """
     Send message to target Claude Code session via Unix Domain Socket.
@@ -1184,20 +1580,32 @@ def send_message_to_claude(
 
     final_payload = wrap_cross_session_xml(message, sender=caller_name, mode=caller_mode)
 
+    owned_listener: PeerReceiptListener | None = None
+    active_listener = receipt_listener
     try:
-        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        s.settimeout(10.0)
-        s.connect(sock_path)
+        if active_listener is None:
+            owned_listener = PeerReceiptListener(sock_path)
+            owned_listener.start()
+            active_listener = owned_listener
 
-        auth_msg = json.dumps({"type": "auth", "token": token}) + "\n"
-        user_msg = json.dumps({
+        user_payload: dict = {
             "type": "user",
             "message": {
                 "role": "user",
                 "content": final_payload,
                 "metadata": metadata,
-            }
-        }) + "\n"
+            },
+        }
+        if active_listener and active_listener.from_address:
+            user_payload["from"] = active_listener.from_address
+            user_payload["msg_id"] = active_listener.msg_uuid
+
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        s.settimeout(10.0)
+        s.connect(sock_path)
+
+        auth_msg = json.dumps({"type": "auth", "token": token}) + "\n"
+        user_msg = json.dumps(user_payload) + "\n"
 
         s.sendall(auth_msg.encode("utf-8"))
         s.sendall(user_msg.encode("utf-8"))
@@ -1207,25 +1615,104 @@ def send_message_to_claude(
         except Exception:
             pass
 
-        time.sleep(0.3)
+        try:
+            s.settimeout(0.3)
+            s.recv(1)
+        except Exception:
+            pass
         s.close()
 
         display_name = session["name"] or session["session_id"]
         sess_id = _preferred_session_id(session)
-        print(f"[Claude Code IPC] Message successfully delivered to session PID {session['pid']} ({display_name}) [ID: {sess_id}] (Req-ID: {nonce}, Mode: {caller_mode}).")
-        if expected_artifact:
-            print(f"[Claude Code IPC] Handshake: Expected artifact registered -> {expected_artifact}", file=sys.stderr)
-        if session.get("status") == "busy":
-            print("[Claude Code IPC] Note: Target session is busy; the message will be processed after its current turn.", file=sys.stderr)
-        elif session.get("status") == "waiting":
-            wf = session.get("waiting_for") or "user input"
-            print(f"[Claude Code IPC] Note: Target session is currently waiting ({wf}); check Claude Desktop to unblock it.", file=sys.stderr)
-        if session.get("entrypoint") == "claude-desktop":
-            print("[Claude Code IPC] Tip: Target is Claude Desktop. If the session holds inbound traffic, check for a review card at the bottom of the chat.", file=sys.stderr)
+        entrypoint = str(session.get("entrypoint") or "")
+        rejection_statuses = {"refused", "dropped", "denied", "expired"}
+
+        if owned_listener is not None:
+            immediate_receipts = (
+                owned_listener.poll(timeout=_NON_WAIT_RECEIPT_GRACE_SECONDS)
+                if owned_listener.socket_path
+                else []
+            )
+            rejected = any(r.get("status") in rejection_statuses for r in immediate_receipts)
+            if rejected:
+                pol, pol_src = resolve_cross_session_inbound_policy(session.get("cwd"))
+                perm_mode, _ = detect_session_permission_mode(session)
+                for receipt in immediate_receipts:
+                    r_pol, r_src = (pol, pol_src) if receipt.get("status") in ("refused", "held") else (None, None)
+                    for line in _format_receipt_event(
+                        receipt,
+                        nonce,
+                        entrypoint,
+                        display_name,
+                        sess_id,
+                        policy=r_pol,
+                        policy_src=r_src,
+                        permission_mode=perm_mode,
+                    ):
+                        print(line, file=sys.stderr)
+                return False
+
+            print(f"[Claude Code IPC] Message successfully delivered to session PID {session['pid']} ({display_name}) [ID: {sess_id}] (Req-ID: {nonce}, Mode: {caller_mode}).")
+            if expected_artifact:
+                print(f"[Claude Code IPC] Handshake: Expected artifact registered -> {expected_artifact}", file=sys.stderr)
+            if session.get("status") == "busy":
+                print("[Claude Code IPC] Note: Target session is busy; the message will be processed after its current turn.", file=sys.stderr)
+            elif session.get("status") == "waiting":
+                wf = session.get("waiting_for") or "user input"
+                print(f"[Claude Code IPC] Note: Target session is currently waiting ({wf}); check Claude Desktop to unblock it.", file=sys.stderr)
+
+            if immediate_receipts:
+                pol, pol_src = resolve_cross_session_inbound_policy(session.get("cwd"))
+                perm_mode, _ = detect_session_permission_mode(session)
+                for receipt in immediate_receipts:
+                    for line in _format_receipt_event(
+                        receipt,
+                        nonce,
+                        entrypoint,
+                        display_name,
+                        sess_id,
+                        policy=pol,
+                        policy_src=pol_src,
+                        permission_mode=perm_mode,
+                    ):
+                        print(line, file=sys.stderr)
+            else:
+                perm_mode, _ = detect_session_permission_mode(session)
+                if perm_mode == "bypassPermissions":
+                    pol, pol_src = resolve_cross_session_inbound_policy(session.get("cwd"))
+                    if pol == "parity_check":
+                        if entrypoint == "claude-desktop":
+                            print(
+                                "[Claude Code IPC] Note: 目标 Claude Desktop 会话当前为 bypassPermissions，"
+                                "在默认 parity_check 策略下外部消息会被暂留且桌面端无审核卡片（5 分钟过期）；"
+                                "建议切为 Auto / Default / Accept Edits。",
+                                file=sys.stderr,
+                            )
+                        else:
+                            print(
+                                "[Claude Code IPC] Note: 目标会话当前为 bypassPermissions，"
+                                "若消息被入站暂留，请在终端底部查看「待审核卡片」（Review it below）并批准。",
+                                file=sys.stderr,
+                            )
+                    elif pol in ("hold", "refuse"):
+                        for gline in _format_inbound_guidance(pol, pol_src, entrypoint=entrypoint, permission_mode=perm_mode):
+                            print(gline, file=sys.stderr)
+        else:
+            print(f"[Claude Code IPC] Message successfully delivered to session PID {session['pid']} ({display_name}) [ID: {sess_id}] (Req-ID: {nonce}, Mode: {caller_mode}).")
+            if expected_artifact:
+                print(f"[Claude Code IPC] Handshake: Expected artifact registered -> {expected_artifact}", file=sys.stderr)
+            if session.get("status") == "busy":
+                print("[Claude Code IPC] Note: Target session is busy; the message will be processed after its current turn.", file=sys.stderr)
+            elif session.get("status") == "waiting":
+                wf = session.get("waiting_for") or "user input"
+                print(f"[Claude Code IPC] Note: Target session is currently waiting ({wf}); check Claude Desktop to unblock it.", file=sys.stderr)
         return True
     except Exception as e:
         print(f"[Claude Code IPC] Failed to send message to socket {sock_path}: {e}", file=sys.stderr)
         return False
+    finally:
+        if owned_listener is not None:
+            owned_listener.close()
 
 
 def send_file(
@@ -1666,7 +2153,12 @@ def send_and_wait(
         cwd_relation_type=rel,
     )
 
+    receipt_listener = PeerReceiptListener(session["socket_path"]) if session.get("socket_path") else None
+
     try:
+        if receipt_listener is not None:
+            receipt_listener.start()
+
         ok = send_message_to_claude(
             full_message,
             target=_preferred_session_id(session) or str(session["pid"]),
@@ -1677,6 +2169,7 @@ def send_and_wait(
             activate_gui=False,
             allow_cross_project=allow_cross_project,
             debug=debug,
+            receipt_listener=receipt_listener,
         )
         if not ok:
             return None, None
@@ -1691,12 +2184,63 @@ def send_and_wait(
         reply_cmd_seen = False
         warned_idle = False
         warned_delivery = False
+        was_held = False
         pending_ask: dict | None = None
         waiting_input_since: float | None = None
         msg_intro_texts: dict[str, list[str]] = {}
         tail_reader = TailReader(transcript_path, start_offset=initial_offset)
         reply_marker = f"reply --to {nonce}"
         target_sid = _preferred_session_id(session) or str(session.get("pid") or "")
+        entrypoint = str(session.get("entrypoint") or "")
+        session_name = str(session.get("name") or target_sid)
+
+        def _process_receipts(receipts: list[dict]) -> bool:
+            nonlocal is_enqueued, warned_idle, was_held
+            for receipt in receipts:
+                st = receipt.get("status")
+                if st == "held":
+                    was_held = True
+                    warned_idle = True
+                    pol, pol_src = resolve_cross_session_inbound_policy(session.get("cwd"))
+                    perm_mode, _ = detect_session_permission_mode(session)
+                    for line in _format_receipt_event(
+                        receipt,
+                        nonce,
+                        entrypoint,
+                        session_name,
+                        target_sid,
+                        policy=pol,
+                        policy_src=pol_src,
+                        permission_mode=perm_mode,
+                    ):
+                        print(line, file=sys.stderr)
+                    if activate_gui and entrypoint == "claude-desktop":
+                        if activate_desktop_app("Claude", new_tab=False):
+                            print("[Claude Code IPC] Brought Claude Desktop to front (`-g`) so you can switch permission mode.", file=sys.stderr)
+                        else:
+                            print("[Claude Code IPC] Could not bring Claude Desktop to front automatically.", file=sys.stderr)
+                elif st == "delivered":
+                    is_enqueued = True
+                    for line in _format_receipt_event(receipt, nonce, entrypoint, session_name, target_sid):
+                        print(line, file=sys.stderr)
+                elif st in ("refused", "dropped", "denied", "expired"):
+                    pol, pol_src = resolve_cross_session_inbound_policy(session.get("cwd"))
+                    for line in _format_receipt_event(
+                        receipt,
+                        nonce,
+                        entrypoint,
+                        session_name,
+                        target_sid,
+                        policy=pol,
+                        policy_src=pol_src,
+                    ):
+                        print(line, file=sys.stderr)
+                    return True
+            return False
+
+        if receipt_listener is not None and receipt_listener.socket_path:
+            if _process_receipts(receipt_listener.poll(timeout=0.05)):
+                return None, "QUEUED_UNCONSUMED"
 
         while time.time() - start_time < timeout:
             # Channel 1: duplex reply socket / mailbox (also serves as the loop's sleep)
@@ -1705,6 +2249,10 @@ def send_and_wait(
                 if debug:
                     print(f"[Claude Code IPC Debug] Response received via duplex channel ({reply_server.channel}).", file=sys.stderr)
                 return r_resp, r_verdict
+
+            if receipt_listener is not None and receipt_listener.socket_path:
+                if _process_receipts(receipt_listener.poll(timeout=0.0)):
+                    return None, "QUEUED_UNCONSUMED"
 
             # Channel 2: Fast-fail checks (PID and socket liveness)
             pid = session.get("pid")
@@ -1881,16 +2429,25 @@ def send_and_wait(
             if not is_enqueued and fast_fail_timeout > 0 and elapsed > fast_fail_timeout:
                 policy, policy_src = resolve_cross_session_inbound_policy(session.get("cwd"))
                 live_state = _read_live_session_state(session)
+                perm_mode, _ = detect_session_permission_mode(session)
                 print(f"\n[Claude Code IPC] 提示: 消息已通过 Socket 送达进程，但在 {int(fast_fail_timeout)} 秒内未进入工作队列 (Req-ID: {nonce})。", file=sys.stderr)
-                print(f"[Claude Code IPC] 这通常是因为目标会话的安全策略正在等待人工审核（入站扣留），或者该会话当前处于挂起/等待用户输入状态。", file=sys.stderr)
+                if was_held:
+                    print(f"[Claude Code IPC] Delivery status: HELD (Req-ID: {nonce}) — 对端入站网关已确认暂留该消息，切勿盲目重发（5 分钟内切出 bypassPermissions 或批准后会自动放行）。", file=sys.stderr)
+                else:
+                    print(f"[Claude Code IPC] 这通常是因为目标会话的安全策略正在等待人工审核或模式对齐（入站扣留），或者该会话当前处于挂起/等待用户输入状态。", file=sys.stderr)
                 print(f"[Claude Code IPC] 目标会话: \"{session.get('name')}\" [ID: {target_sid}, PID: {session['pid']}]", file=sys.stderr)
                 if live_state.get("status") == "waiting":
                     wf = live_state.get("waiting_for") or "user input"
                     print(f"[Claude Code IPC] ⚠️ 检测到目标会话当前处于 waiting 状态 (waitingFor: {wf})，请先在 Claude Desktop 处理当前待选卡片/弹窗。", file=sys.stderr)
                 print("\n👉 排查建议（按安全推荐顺序）：", file=sys.stderr)
-                for gline in _format_inbound_guidance(policy, policy_src):
+                for gline in _format_inbound_guidance(
+                    policy,
+                    policy_src,
+                    entrypoint=entrypoint,
+                    permission_mode=perm_mode,
+                ):
                     print(gline, file=sys.stderr)
-                print(f"  • 如批准后对方稍晚完成答复，也可使用 `agent-pair-ipc claude -r -s {target_sid}` 或 `agent-pair-ipc inbox {nonce}` 取回。\n", file=sys.stderr)
+                print(f"  • 如稍晚切换模式或批准后对方完成答复，可使用 `agent-pair-ipc claude -r -s {target_sid}` 或 `agent-pair-ipc inbox {nonce}` 取回。\n", file=sys.stderr)
                 return None, "QUEUED_UNCONSUMED"
 
             # Inform if enqueued and waiting for busy previous turn
@@ -1908,12 +2465,13 @@ def send_and_wait(
 
             if not is_enqueued and elapsed > 25.0 and not warned_delivery:
                 warned_delivery = True
-                print(f"[Claude Code IPC] Notice: Request nonce {nonce} has not appeared in transcript after 25s. Peer session may be busy or waiting for approval.", file=sys.stderr)
+                print(f"[Claude Code IPC] Notice: Request nonce {nonce} has not appeared in transcript after 25s. Peer session may be busy or waiting for mode/approval.", file=sys.stderr)
 
             if not warned_idle and elapsed > _IDLE_WARN_SECONDS and not is_enqueued:
                 warned_idle = True
                 live_state = _read_live_session_state(session)
                 policy, policy_src = resolve_cross_session_inbound_policy(session.get("cwd"))
+                perm_mode, _ = detect_session_permission_mode(session)
                 if live_state.get("status") == "waiting":
                     wf = live_state.get("waiting_for") or "user input"
                     print(
@@ -1925,16 +2483,23 @@ def send_and_wait(
                         f"[Claude Code IPC] Warning: Inferred crossSessionInbound policy is 'refuse' ({policy_src}); inbound message will likely be rejected.",
                         file=sys.stderr,
                     )
-                else:
-                    tip_gui = " (pass `-g` to bring Claude Desktop to front automatically)" if (session.get("entrypoint") == "claude-desktop" and not activate_gui) else ""
+                elif entrypoint == "claude-desktop":
+                    mode_hint = f" (当前权限模式: {perm_mode})" if perm_mode else ""
+                    tip_gui = " (pass `-g` to bring Claude Desktop to front automatically)" if not activate_gui else ""
                     print(
-                        f"[Claude Code IPC] Notice: No enqueue event after {int(_IDLE_WARN_SECONDS)}s (inferred policy: {policy}). "
-                        f"Check for a pending inbound review card at the bottom of session \"{session.get('name') or target_sid}\"{tip_gui}.",
+                        f"[Claude Code IPC] Notice: No enqueue event after {int(_IDLE_WARN_SECONDS)}s (inferred policy: {policy}{mode_hint}). "
+                        f"Claude Desktop has no inbound review card UI; if session \"{session_name}\" is in bypassPermissions, switch it to Auto / Default / Accept Edits to release the message{tip_gui}.",
                         file=sys.stderr,
                     )
-                if activate_gui and session.get("entrypoint") == "claude-desktop" and policy != "refuse":
+                else:
+                    print(
+                        f"[Claude Code IPC] Notice: No enqueue event after {int(_IDLE_WARN_SECONDS)}s (inferred policy: {policy}). "
+                        f"Check for a pending inbound review card at the bottom of session \"{session_name}\".",
+                        file=sys.stderr,
+                    )
+                if activate_gui and entrypoint == "claude-desktop" and policy != "refuse":
                     if activate_desktop_app("Claude", new_tab=False):
-                        print("[Claude Code IPC] Brought Claude Desktop to front (`-g`) so you can review/approve any pending card.", file=sys.stderr)
+                        print("[Claude Code IPC] Brought Claude Desktop to front (`-g`) so you can switch permission mode or check session state.", file=sys.stderr)
                     else:
                         print("[Claude Code IPC] Could not bring Claude Desktop to front automatically.", file=sys.stderr)
 
@@ -1942,6 +2507,8 @@ def send_and_wait(
         print(f"[Claude Code IPC] A late reply will be kept in the mailbox: agent-pair-ipc inbox {nonce}", file=sys.stderr)
         return None, None
     finally:
+        if receipt_listener is not None:
+            receipt_listener.close()
         reply_server.close()
 
 
@@ -1978,6 +2545,12 @@ def list_sessions(candidates: list[dict] | None = None, debug: bool = False):
             print(f"{c['pid']:<7} {kind_entry:<30} {status:<18} {sid:<38} {c.get('name', '')}{is_self}{is_cwd}{is_bound}")
             if c.get("host_session_id"):
                 print(f"        └─ Host ID:    {c['host_session_id']}")
+            perm_mode, _ = detect_session_permission_mode(c)
+            if perm_mode:
+                mode_note = ""
+                if c.get("entrypoint") == "claude-desktop" and perm_mode == "bypassPermissions":
+                    mode_note = " (⚠️ Desktop bypassPermissions holds external messages under default parity_check)"
+                print(f"        └─ Mode:       {perm_mode}{mode_note}")
             print(f"        └─ Socket:     {c['socket_path']}")
             print(f"        └─ CWD:        {c['cwd']}")
             print(f"        └─ Transcript: {c['transcript_path'] or '(not found)'}\n")
@@ -2052,7 +2625,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("-r", "--read", action="store_true", help="Read the latest assistant feedback/response from the target session (supports offline fallback)")
     parser.add_argument("-a", "--all-turns", action="store_true", help="Include intermediate tool-use turns when reading transcript (default: final turns only)")
     parser.add_argument("-n", "--number", type=int, default=1, help="Number of assistant turns to read (default: 1)")
-    parser.add_argument("-g", "--activate-gui", action="store_true", help="Bring Claude Desktop to front (triggers File > New Session with --await-new-session, or surfaces pending review cards during -w)")
+    parser.add_argument("-g", "--activate-gui", action="store_true", help="Bring Claude Desktop to front (triggers File > New Session with --await-new-session, or brings Desktop forward during -w when mode switch/attention is needed)")
     parser.add_argument("--intent", default="Read-Only Review", help="Peer cooperation intent declaration (default: 'Read-Only Review')")
     parser.add_argument("--user-context", default=None, help="User prompt authorization context to pass in peer envelope")
     parser.add_argument("--sender", default=None, help="Sender name in the peer envelope (default: $AGENT_PAIR_SENDER or auto-detected)")
@@ -2076,7 +2649,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"当前推断生效策略: {policy}")
         print(f"判定来源: {src}")
         print("\n策略说明:")
-        print("  • parity_check (默认): 发送方与目标会话模式对齐时放行，bypassPermissions 会话需卡片审核。")
+        print("  • parity_check (默认): 发送方与目标会话模式对齐时放行；bypassPermissions 会话会触发入站暂留（CLI 终端底部显示审核卡片；Claude Desktop 无审核卡片 UI，需切为 Auto/Default/Accept Edits，否则 5 分钟后过期）。")
         print("  • accept: 无条件接收入站消息（注意: 仅在用户全局配置生效，对 bypass 会话将免确认执行）。")
         print("  • hold: 所有入站消息均暂缓扣留待审。")
         print("  • refuse: 拒绝所有入站跨会话消息。")

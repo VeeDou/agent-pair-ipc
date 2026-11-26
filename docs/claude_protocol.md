@@ -23,22 +23,34 @@ Claude Code running locally (CLI or Desktop app) listens on a Unix Domain Socket
 
 ## 3. Communication Protocol
 
-1. **Connect**: Connect via `AF_UNIX` stream socket to `messagingSocketPath`.
-2. **Authentication Frame**:
+1. **Optional Ephemeral Receipt Listener**: Before connecting, bind a `0o600` Unix socket in the **exact same lexical directory** as `messagingSocketPath` (e.g. `/tmp/cc-socks/ap-<pid>-<rand>.sock` — without resolving `/tmp` symlinks so Claude Code's directory vetting accepts it) and generate a UUID4 `msg_id`.
+2. **Connect**: Connect via `AF_UNIX` stream socket to `messagingSocketPath`.
+3. **Authentication Frame**:
    ```json
    {"type": "auth", "token": "<peerToken>"}\n
    ```
-3. **User Message Frame**:
+4. **User Message Frame**:
    ```json
-   {"type": "user", "message": {"role": "user", "content": "<text>"}}\n
+   {"type": "user", "from": "uds:/tmp/cc-socks/ap-<pid>-<rand>.sock", "msg_id": "<uuid4>", "message": {"role": "user", "content": "<text>", "metadata": {...}}}\n
    ```
-4. **Close**: Close connection after frames are flushed.
+5. **Half-Close & EOF**: Call `shutdown(SHUT_WR)` and close after server EOF (or short timeout).
+6. **Native `peer_message_status` Reverse Receipts**: Claude Code never replies on the inbound socket. Instead, when `from` + UUID4 `msg_id` are provided, Claude Code vets the peer PID/UID and connects back to the receipt socket with a `control` frame:
+   ```json
+   {"type": "control", "action": "peer_message_status", "status": "held|delivered|refused|dropped|denied|expired", "status_detail": "refused", "reason": "...", "orig_msg_id": "<uuid4>"}
+   ```
+   - `status: "expired"` with `status_detail: "refused"` is normalized to `"refused"`.
+   - `refused` / `dropped` / `denied` / `expired` allow immediate fail-fast without waiting `fast_fail_timeout`, guaranteeing the message was NOT queued and is safe to retry once fixed.
+   - `held` confirms the message is parked in Claude Code's inbound gate memory (`Zo().inbound.held`): callers MUST NOT blindly resend.
+7. **Desktop vs CLI Hold Behavior & Read-Only `permissionMode` Detection**:
+   - Claude Code CLI TUI (`entrypoint: cli`) renders a bottom `"Review it below"` approval card for held messages.
+   - Claude Desktop (`entrypoint: claude-desktop`) runs `claude` in headless `stream-json` mode with **no approval card UI**; held messages expire automatically after 5 minutes unless the user switches the Desktop session out of `bypassPermissions` (e.g. `auto`, `default`, `acceptEdits`, which immediately updates `claude-code-sessions/*/*/<hostSessionId>.json` and releases held messages) or `crossSessionInbound` becomes `"accept"`.
+   - `agent-pair-ipc` performs strictly read-only `permissionMode` inspection (Desktop local session JSON first, JSONL transcript tail fallback) to surface `Mode:` in `-l` and give accurate guidance.
 
-The peer socket is one-way. Answers come back over the agent-pair-ipc duplex reply channel
-(`agent-pair-ipc reply --to <Req-ID>`, advertised in every Peer Envelope). See
+Answers to the request itself come back over the agent-pair-ipc duplex reply channel
+(`agent-pair-ipc reply --to <Req-ID>`, advertised in every Peer Envelope) or the JSONL transcript. See
 [duplex_reply_protocol.md](duplex_reply_protocol.md).
 
-Session metadata also exposes `status` (`idle` / `busy`) and `updatedAt`. `claude-ipc --list` shows the status,
+Session metadata also exposes `status` (`idle` / `busy`) and `updatedAt`. `claude-ipc --list` shows the status and `permissionMode`,
 and the sender is told when its message will queue behind a busy turn.
 
 ## 4. Transcript Monitoring

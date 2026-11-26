@@ -62,9 +62,10 @@ flowchart TD
 ## ✨ 核心特性
 
 - 🪶 **0 第三方依赖（Zero-Dependency）**：仅采用 Python 3.10+ 原生标准库（`socket`、`json`、`subprocess`、`argparse`、`pathlib`），无需 `pip install` 任何沉重依赖，开箱即用。
-- 🔌 **原生支持主流双引擎**：
-  - **Claude Code**：通过 Unix Domain Socket（UDS）进行双向鉴权通信，实时解析会话 JSONL 转储。
+- 🔌 **原生支持三大主流引擎**：
+  - **Claude Code**：通过 Unix Domain Socket（UDS）进行双向鉴权通信，实时解析会话 JSONL 转储，接收原生 `peer_message_status` 反向回执，并探测实时 `permissionMode`。
   - **OpenAI Codex**：利用原生 `codex queue` 管道投递消息，精准监控 Rollout 事件流中的 `Reasoning`、工具调用与 `task_complete`。
+  - **Google Antigravity** *(实验性，已实测跑通)*：通过桌面端 Language Server `agentapi` 投递消息，配合只读 SQLite 会话发现与 `transcript.jsonl` 兜底追踪。详见 [docs/antigravity_protocol.md](docs/antigravity_protocol.md)。
 - 🎯 **多工程路由防线与 CWD 亲和性硬阻断**：基于当前工作目录自动匹配同源会话；强校验 `bindings.json` 与环境变量，失效脏绑定自动告警并回退探测；默认严格硬阻断跨工程串线投递（`cross_project_rejected`），跨工程调用强制要求 `--allow-cross-project=<目标路径>` 显式放行且严禁使用易复用的 PID。
 - 🔗 **多工程别名与软链接感知**：支持在 `.agent-pair/config.json` 中配置 `"aliases": [...]` 别名工作区；支持单层顶层软链接感知与严格的工程根边界保护（非真实项目根禁止祖先路径放宽，杜绝误匹配 `$HOME` 等根目录）。
 - 🛡️ **路径参数防呆与名称去歧义**：拦截误传给 `-s` 的文件路径并给出指引，同时放行包含斜杠的合法会话标题（如 `"UI/UX 评审"`）；名称子串多重匹配严格拒绝猜选。
@@ -108,6 +109,7 @@ pip install -e .
 agent-pair-ipc list
 claude-ipc -w -f ./templates/REVIEW_REQUEST.md
 codex-ipc -w -f ./templates/REVIEW_REQUEST.md
+antigravity-ipc -w -f ./templates/REVIEW_REQUEST.md
 ```
 
 ### 方式 3：全工作区统一接入同一引擎
@@ -168,7 +170,20 @@ codex-ipc -r -s 01234567-89ab-cdef-0123-456789abcdef
 codex-ipc -l
 ```
 
-### 3. 双向回调（`agent-pair-ipc reply` / `inbox`）
+### 3. Antigravity Desktop 交互 (`antigravity-ipc` 或 `agent-pair-ipc antigravity`)
+
+```bash
+# 交付报告给当前项目的 Antigravity Desktop 会话并阻塞等待结论
+antigravity-ipc -w -f docs/reports/REVIEW_REQUEST.md
+
+# 只读模式：直接拉取最新一条回复（不发送新消息）
+antigravity-ipc -r
+
+# 查看当前 Antigravity Desktop 会话列表
+antigravity-ipc -l
+```
+
+### 4. 双向回调（`agent-pair-ipc reply` / `inbox`）
 
 ```bash
 # 接收方：回传答复（完整命令已印在信封中）

@@ -18,10 +18,10 @@ description: >-
 - **Claude Code 负责独立复核与质量把关**：运行测试复核、比对设计规范、给出评审结论或提出下一期方案。
 - **核心规程**：每当一个大功能/期数开发完成或遇到需决策事项时，Antigravity **主动停下**，通过本 Skill 将完整的复核包交由 Claude Code 审查，等待答复后再决定后续动作。
 
-通道构成（v0.3）：
-1. **投递**：Unix Domain Socket 注入目标会话（`~/.claude/sessions/<pid>.json` + peerToken）。
+通道构成：
+1. **投递**：Unix Domain Socket 注入目标会话（`~/.claude/sessions/<pid>.json` + peerToken），并附带同目录 `0600` 临时回执 Socket 接收 Claude Code 原生 `peer_message_status` 状态（`held` / `delivered` / `refused` / `dropped` / `denied` / `expired`）。
 2. **回传**：请求方监听临时回调 Socket `~/.agent-pair/run/reply-<Req-ID>.sock`，对方通过 `agent-pair-ipc reply --to <Req-ID>` 直接回传；请求方不在线时自动存入收件箱 `~/.agent-pair/run/replies/`。
-3. **兜底**：增量 TailReader 读取 JSONL 转录，双轨运行，先到先得（回调通道优先）。
+3. **兜底与探测**：增量 TailReader 读取 JSONL 转录（与回调双轨运行，先到先得）；只读探测目标会话当前 `permissionMode`（桌面端实时状态文件 + 转录尾部）。
 
 ---
 
@@ -107,12 +107,39 @@ agent-pair-ipc claude -l
    ```json
    {
      "aliases": [
-       "/Users/liuvictory/Duanju"
+       "/path/to/Duanju"
      ]
    }
    ```
 2. **符号链接探测**：若工程顶层存在指向桌面端项目的软链接（或反向包含软链接），工具会自动探测并识别为 `[Linked Project]`。
 优先级严格遵循：`exact > linked > ancestor`。同级若出现多个候选，坚决触发“歧义即拒绝”，绝不盲目随机挑选。
+
+### 场景 H：探索讨论 / 设计问答（非评审消息）
+```bash
+# 仅讨论观点、方案碰撞，不要求 VERDICT 行时：必须带 -w，不要加 --expect-file
+agent-pair-ipc claude -w -t 300 --intent "Exploratory Design Discussion (Read-Only)" -f - <<'AP_EOF'
+请先说说你对当前 UI 重构方案的看法，不用改代码。
+AP_EOF
+```
+对方完成答复后因正文末行不含 `VERDICT:`，命令会返回 **Exit 3 (`EXIT_NO_VERDICT`)** 并在 stdout 打印 `=== [Claude Code Response] ===`——**这对非评审讨论属于正常成功**，直接读取答复即可，不要误判为失败。
+
+---
+
+## 3.5 发前避坑与异常处置（Exit 4 决策树）
+
+1. **会话 ID 规则（先排除误判）**：
+   - `-s` 同时支持持久 `sessionId`（UUID，**优先**）与前端临时 `hostSessionId`（`local_*`），`-l` 会同时列出两者。
+   - 只要命令打印了 `Message successfully delivered ...`，目标 PID/Socket/Token 就已准确匹配，**Exit 4 绝不是 ID 传错**。
+2. **权限模式与端侧差异（最常见阻塞点）**：
+   - 外部调用方按安全契约固定声明 `from-mode="prompting"`。发前先用 `agent-pair-ipc claude -l` 看目标会话的 `Mode:`：
+   - **Claude Desktop（`entrypoint: claude-desktop`）**：桌面端运行于 headless 模式，**界面没有「待审核卡片」UI**。当目标会话处于 `bypassPermissions` 且入站策略为默认 `parity_check` 时，消息会被对端在内存中 `HELD` 并在 **5 分钟后自动过期**。
+     - **发前看到 `bypassPermissions`**：简短提示用户将桌面端会话左下角切为 **`Auto` / `Default` / `Accept Edits`**。
+     - **发后收到 `HELD` / Exit 4**：**切勿重复重发**；提醒用户 5 分钟内切换模式即可自动放行原消息，随后用 `agent-pair-ipc claude -r -s <sessionId>` 或 `inbox <Req-ID>` 取结果。
+   - **Claude Code CLI（终端 TUI）**：会在终端底部显示「Review it below」卡片，提示用户点击批准即可放行。
+3. **重试红线与只读边界**：
+   - 看到 `Delivery status: HELD` 或未收到拒绝回执的 Exit 4 → **禁止重发**（防止模式切换后重复执行）。
+   - 收到 `REFUSED` / `EXPIRED` / `DENIED` / `DROPPED` → 工具已确认**未入对端队列**，排除原因（如 `--doctor` 核查配置、切换模式）后**可安全重发**。
+   - **严禁** Agent 自行修改 `~/.claude/settings.json` 或要求对端修改权限配置。
 
 ---
 
@@ -139,12 +166,12 @@ agent-pair-ipc claude -l
 1. **自测完备**：本地测试通过、门禁绿灯，准备客观证据（命令与输出）。
 2. **起草交付包**：原始目标、已实施内容、客观证据、未确定事项、可一键重跑的复核命令；写入文件。
 3. **闭环交付铁律（严禁裸发）**：
-   - 凡是将代码、设计方案或测试报告交由 Claude Code 复核，**必须附加 `-w`（阻塞等待模式）**。
+   - 凡是将代码、设计方案或测试报告交由 Claude Code 复核/讨论，**必须附加 `-w`（阻塞等待模式）**。
    - 如果约定由 Claude Code 生成复核文件（如 `*_REVIEW.md`），**必须同时附加 `--expect-file <路径>`**，以开启产物稳定捕获（产物含 VERDICT 且写入静默 3 秒后即时返回）。
-     > [!NOTE] `--expect-file` 专门用于约定输出包含 `VERDICT: SIGN_OFF` 或 `VERDICT: CHANGES_REQUESTED` 判定行的最终评审产物；对于无需 VERDICT 的非评审类文档（如普通设计方案或草稿），调用方请通过转录流或回调通道获取结论。
+     > [!NOTE] `--expect-file` 专门用于约定输出包含 `VERDICT: SIGN_OFF` 或 `VERDICT: CHANGES_REQUESTED` 判定行的最终评审产物；对于无需 VERDICT 的探索讨论/问答类消息（`Exploratory Design Discussion`），**不要加 `--expect-file`**，收到 Exit 3 即视为正常拿到答复。
    - **禁止**以非阻塞方式（不带 `-w`）发送后直接对用户回复“已提交复核，静候答复”并结束回合，避免发生长达数小时的协作死寂。
    - 可加 `--user-context "<用户原话>"` 如实声明用户授权上下文（不得编造）。
-4. **获取复核结论**：脚本返回 Exit 0/2 并输出 `=== [Claude Code Response] ===` 后，提炼结论向用户汇报，**并停下来等待用户裁决**。若遇到未消费超时或会话挂起（Exit 4），使用 `agent-pair-ipc inbox <Req-ID>` 取件或切换前台唤醒会话重新等待。
+4. **获取复核结论**：脚本返回 Exit 0/2（或非评审讨论返回 Exit 3）并输出 `=== [Claude Code Response] ===` 后，提炼结论向用户汇报，**并停下来等待用户裁决**。若遇到未消费超时或会话挂起（Exit 4）：先看 stderr 中的 `Delivery status`（`HELD` 则不重发，提示用户桌面端切出 `bypassPermissions` 或 CLI 批准卡片；`REFUSED`/`EXPIRED`/`DROPPED`/`DENIED` 才在排除原因后安全重发），放行后可用 `agent-pair-ipc claude -r -s <sessionId>` 或 `agent-pair-ipc inbox <Req-ID>` 取件。
 5. **防跨工程串线安全准则**：
    - **禁止向 `-s / --session` 传递文件系统路径**（如传入含 `/` 或以 `~` 开头的路径直接报错退出并提示正确用法）。
    - **脏绑定自动忽略保护**：若 `bindings.json` 中的历史会话与当前 CWD 无亲和性，工具会自动警告并忽略该失效绑定，安全回退到当前工程自动探测。
@@ -157,8 +184,8 @@ agent-pair-ipc claude -l
 - `0` (`EXIT_SIGN_OFF`)：复核通过，最终行为 `VERDICT: SIGN_OFF`（`reply` 成功投递/入箱也返回 0）。
 - `1` (`EXIT_ERROR`)：执行错误、进程崩溃（`PROCESS_TERMINATED`）、Socket 消失（`SOCKET_DISAPPEARED`）或常规超时。
 - `2` (`EXIT_CHANGES_REQUESTED`)：复核退回，最终行为 `VERDICT: CHANGES_REQUESTED`。
-- `3` (`EXIT_NO_VERDICT`)：对方完成回答但未包含格式化 VERDICT 行。
-- `4` (`EXIT_QUEUED_UNCONSUMED`)：请求在 `fast_fail_timeout` 内未能确认进入对端队列（入站扣留待审或目标会话挂起；可用 `--doctor` 诊断策略、传 `-g` 在 8s 未入队时自动将桌面端切前台查看卡片，或稍后用 `-r` / `agent-pair-ipc inbox <Req-ID>` 取件）。
+- `3` (`EXIT_NO_VERDICT`)：对方完成回答但未包含格式化 VERDICT 行（对于探索讨论、设计问答等非评审请求属于正常成功，直接读取 stdout 答复）。
+- `4` (`EXIT_QUEUED_UNCONSUMED`)：请求未进入对端工作队列。查看 stderr 的 `Delivery status`：`HELD`（桌面端 `bypassPermissions` 无审核卡片、5 分钟过期，需切为 `Auto`/`Default`/`Accept Edits`；CLI 在终端底部批准）绝勿盲目重发；`REFUSED`/`EXPIRED`/`DROPPED`/`DENIED` 已确认未入队，排除原因后可安全重发；可用 `--doctor` 诊断策略，放行后用 `-r -s <sessionId>` 或 `inbox <Req-ID>` 取件。
 - `5` (`EXIT_NEEDS_NEW_THREAD`)：新工程无会话且运行于非交互环境，提示用户新建会话或改用 `--await-new-session`。
 - `6` (`EXIT_NEEDS_USER_INPUT`)：目标会话调用 `AskUserQuestion` 或进入 `waiting`（`waitingFor: "input needed"`）等待用户点选；stdout 已输出格式化的问题与选项，提示用户去桌面端作答后再用 `-r` 获取最终结论。
 
@@ -181,7 +208,7 @@ agent-pair-ipc claude -l
 | `--await-new-session` | 显式等待新会话或休眠会话唤醒，捕获后自动绑定持久 `sessionId` 并发送 | `--await-new-session` |
 | `--await-timeout` | 等待新会话的秒数（默认 120） | `--await-timeout 180` |
 | `--no-auto-new` | 禁用无会话时的自动等待感应 | `--no-auto-new` |
-| `-g`, `--activate-gui` | 将 Claude Desktop 切至前台（配合 `--await-new-session` 触发新建；配合 `-w` 在 8s 未入队时切前台便于审核待批卡片） | `-g` |
+| `-g`, `--activate-gui` | 将 Claude Desktop 切至前台（配合 `--await-new-session` 触发新建；配合 `-w` 在需要用户切换模式或注意会话时切前台，Desktop 端无入站审核卡片） | `-g` |
 | `--doctor` | 只读诊断当前目录生效的 `crossSessionInbound` 策略级联与配置指引 | `--doctor` |
 | `--intent` | 对等意图声明（Read-Only Review / Edit and Fix / Notification …） | `--intent "Notification"` |
 | `--user-context` | 如实引用用户原话作为授权上下文 | `--user-context "把这个拿给Claude code审核"` |

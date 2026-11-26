@@ -59,9 +59,10 @@ Most multi-agent frameworks spawn ephemeral, cold-started API instances that hav
 ## ✨ Key Features
 
 - 🪶 **Zero Third-Party Dependencies**: Pure Python 3.10+ standard library (`socket`, `json`, `subprocess`, `argparse`, `pathlib`). Works immediately on macOS without `pip install` bloat.
-- 🔌 **Dual Engine Support**:
-  - **Claude Code**: Interacts directly with CLI / Desktop sessions via Unix Domain Sockets (`AF_UNIX`) and tracks project JSONL transcripts.
+- 🔌 **Tri-Engine Support**:
+  - **Claude Code**: Interacts directly with CLI / Desktop sessions via Unix Domain Sockets (`AF_UNIX`), tracks project JSONL transcripts, receives native `peer_message_status` reverse receipts, and detects live `permissionMode`.
   - **OpenAI Codex**: Injects messages via native `codex queue` and monitors rollout event streams (`Reasoning`, `custom_tool_call`, `task_complete`).
+  - **Google Antigravity** *(Experimental, live-verified)*: Connects to Antigravity Desktop sessions via Language Server `agentapi`, read-only SQLite conversation discovery, and `transcript.jsonl` fallback. See [docs/antigravity_protocol.md](docs/antigravity_protocol.md).
 - 🎯 **Safe Multi-Project Routing & CWD Affinity**: Automatically identifies active sessions matching current project working directory (`cwd`) with strict dirty-binding invalidation and fallback. Hard blocks accidental cross-project calls by default (`cross_project_rejected`), requiring explicit `--allow-cross-project=<target_cwd>` confirmation to avoid context pollution across projects. Disallows raw PIDs across projects.
 - 🔗 **Project Aliases & Symlink Awareness**: Supports multi-directory worktrees via `.agent-pair/config.json` (`"aliases": [...]`) and top-level directory symlinks with strict safety boundaries (ancestor relaxation restricted to verified `.git` / `.agent-pair` roots).
 - 🛡️ **Path Guard & Ambiguity Defense**: Blocks accidental filesystem paths in `-s` with user-friendly diagnostics while allowing title names containing slashes (e.g. `"UI/UX 评审"`). Refuses to guess on ambiguous session names.
@@ -105,6 +106,7 @@ pip install -e .
 agent-pair-ipc list
 claude-ipc -w -f ./templates/REVIEW_REQUEST.md
 codex-ipc -w -f ./templates/REVIEW_REQUEST.md
+antigravity-ipc -w -f ./templates/REVIEW_REQUEST.md
 ```
 
 ### Option 3: One engine for every workspace
@@ -165,7 +167,20 @@ codex-ipc -r -s 01234567-89ab-cdef-0123-456789abcdef
 codex-ipc -l
 ```
 
-### 3. Duplex replies (`agent-pair-ipc reply` / `inbox`)
+### 3. Antigravity Desktop IPC (`antigravity-ipc` or `agent-pair-ipc antigravity`)
+
+```bash
+# Deliver report to active Antigravity Desktop conversation and wait for conclusion
+antigravity-ipc -w -f docs/reports/REVIEW_REQUEST.md
+
+# Read latest finished response without sending a new message
+antigravity-ipc -r
+
+# List Antigravity Desktop conversations
+antigravity-ipc -l
+```
+
+### 4. Duplex replies (`agent-pair-ipc reply` / `inbox`)
 
 ```bash
 # Receiver side: answer the request (the exact command is printed in the envelope)
@@ -226,21 +241,25 @@ For a detailed walkthrough, read the [Pair Programming SOP & Best Practices Guid
 ```text
 agent-pair-ipc/
 ├── agent_pair_ipc/            # Core Python package (Zero external dependencies)
+│   ├── antigravity.py         # Antigravity Desktop Language Server client & transcript tracker
 │   ├── claude.py              # Claude Code UDS socket client & transcript tracker
 │   ├── codex.py               # Codex queue injector & rollout event watcher
-│   ├── cli.py                 # Unified CLI (claude / codex / list / reply / inbox)
+│   ├── cli.py                 # Unified CLI (claude / codex / antigravity / list / reply / inbox)
 │   └── common.py              # Payload pipeline, Peer Envelope, duplex reply channel, CWD matching, GUI
 ├── bin/                       # Self-contained standalone executables
 │   ├── agent-pair-ipc
+│   ├── antigravity-ipc
 │   ├── claude-ipc
 │   └── codex-ipc
 ├── skills/                    # Antigravity / Gemini / Agent Skill definitions
+│   ├── antigravity-ipc/       # SKILL.md + scripts/antigravity_ipc.py shim (`make link-skills`)
 │   ├── claude-code-ipc/       # SKILL.md + scripts/claude_code_ipc.py shim (`make link-skills`)
 │   └── codex-ipc/
 ├── templates/                 # Review & handoff contract markdown templates
 │   ├── REVIEW_REQUEST.md
 │   └── HANDOFF_PROTOCOL.md
 ├── docs/                      # Technical protocol specs & in-depth guides
+│   ├── antigravity_protocol.md
 │   ├── claude_protocol.md
 │   ├── codex_protocol.md
 │   ├── duplex_reply_protocol.md

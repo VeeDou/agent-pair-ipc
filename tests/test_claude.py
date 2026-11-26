@@ -529,14 +529,14 @@ class TestClaude(unittest.TestCase):
             "session_id": "sess-path-guard",
             "host_session_id": "host-path-guard",
             "name": "Path Guard Session",
-            "cwd": "/Users/liuvictory/projects/AI_PM",
+            "cwd": "/Users/alice/projects/AI_PM",
             "socket_path": "/fake/sock",
             "token": "tok123",
             "mtime": 100.0,
         }
 
         # Case 1: Target starts with /
-        sess, status = match_session(target="/Users/liuvictory/projects/AI_PM", candidates=[fake_session])
+        sess, status = match_session(target="/Users/alice/projects/AI_PM", candidates=[fake_session])
         self.assertIsNone(sess)
         self.assertEqual(status, "invalid_target")
 
@@ -1619,6 +1619,546 @@ class TestClaude(unittest.TestCase):
             rid_empty, status_empty = resolve_bind_target("   ", cwd=curr)
             self.assertIsNone(rid_empty)
             self.assertEqual(status_empty, "empty")
+
+    def test_detect_session_permission_mode_prefers_live_desktop_json_over_stale_transcript(self):
+        from agent_pair_ipc.claude import detect_session_permission_mode
+
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            desktop_root = base / "claude-code-sessions"
+            host_id = "local_1214bb42-5893-44af-bf15-f7be2d118b8c"
+            cli_sid = "2b214ae2-acba-4fda-88c1-5674e6d82559"
+            sess_dir = desktop_root / "org1" / "proj1"
+            sess_dir.mkdir(parents=True)
+            (sess_dir / f"{host_id}.json").write_text(
+                json.dumps({
+                    "sessionId": host_id,
+                    "cliSessionId": cli_sid,
+                    "permissionMode": "auto",
+                }),
+                encoding="utf-8",
+            )
+            tr_path = base / f"{cli_sid}.jsonl"
+            tr_path.write_text(
+                "\n".join([
+                    json.dumps({"type": "user", "permissionMode": "bypassPermissions", "message": {"role": "user", "content": "hi"}}),
+                    json.dumps({"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": "ok"}]}}),
+                ]) + "\n",
+                encoding="utf-8",
+            )
+
+            sess = {
+                "session_id": cli_sid,
+                "host_session_id": host_id,
+                "transcript_path": str(tr_path),
+                "permission_mode": "default",
+            }
+            mode, src = detect_session_permission_mode(sess, desktop_sessions_root=desktop_root)
+            self.assertEqual((mode, src), ("auto", "desktop_session"))
+
+            # Without Desktop JSON, falls back to transcript tail
+            (sess_dir / f"{host_id}.json").unlink()
+            mode2, src2 = detect_session_permission_mode(sess, desktop_sessions_root=desktop_root)
+            self.assertEqual((mode2, src2), ("bypassPermissions", "transcript"))
+
+            # Invalid traversal host_session_id never escapes root; falls back safely
+            sess_bad = {"session_id": cli_sid, "host_session_id": "../evil", "transcript_path": "", "permission_mode": "default"}
+            mode3, src3 = detect_session_permission_mode(sess_bad, desktop_sessions_root=desktop_root)
+            self.assertEqual((mode3, src3), ("default", "session"))
+
+            # Multi-file Desktop JSON tie-breaking: matching cliSessionId beats newer unrelated file
+            p_match = desktop_root / "org2" / "proj2" / f"{host_id}.json"
+            p_match.parent.mkdir(parents=True)
+            p_match.write_text(json.dumps({"cliSessionId": cli_sid, "permissionMode": "acceptEdits"}), encoding="utf-8")
+            p_other = desktop_root / "org3" / "proj3" / f"{host_id}.json"
+            p_other.parent.mkdir(parents=True)
+            p_other.write_text(json.dumps({"cliSessionId": "other-cli-sid", "permissionMode": "bypassPermissions"}), encoding="utf-8")
+            os.utime(p_match, (1000, 1000))
+            os.utime(p_other, (2000, 2000))
+            mode4, src4 = detect_session_permission_mode({"session_id": cli_sid, "host_session_id": host_id}, desktop_sessions_root=desktop_root)
+            self.assertEqual((mode4, src4), ("acceptEdits", "desktop_session"))
+
+            # Large transcript (>256 KiB): top-level permissionMode before >280KB api-request-blob containing '"permissionMode"' noise
+            large_tr = base / "large.jsonl"
+            with open(large_tr, "w", encoding="utf-8") as f:
+                f.write(json.dumps({"type": "user", "permissionMode": "auto", "message": {"role": "user", "content": "start"}}) + "\n")
+                for _ in range(10):
+                    f.write(json.dumps({"type": "api-request-blob", "blob": 'noise "permissionMode":"bypassPermissions" ' + ("x" * 30000)}) + "\n")
+            mode5, src5 = detect_session_permission_mode({"transcript_path": str(large_tr)})
+            self.assertEqual((mode5, src5), ("auto", "transcript"))
+
+    def test_wrap_cross_session_xml_case_insensitive_escape(self):
+        from agent_pair_ipc.claude import wrap_cross_session_xml
+
+        payload = "One </CROSS-SESSION-MESSAGE> two </ cross-session-message> three"
+        wrapped = wrap_cross_session_xml(payload, sender="Antigravity")
+        self.assertIn("<\\/CROSS-SESSION-MESSAGE>", wrapped)
+        self.assertIn("<\\/ cross-session-message>", wrapped)
+        self.assertTrue(wrapped.endswith("\n</cross-session-message>"))
+
+    def test_format_inbound_guidance_distinguishes_desktop_vs_cli(self):
+        from agent_pair_ipc.claude import _format_inbound_guidance, _format_receipt_event
+
+        desk_lines = "\n".join(
+            _format_inbound_guidance(
+                "parity_check",
+                "未显式配置",
+                entrypoint="claude-desktop",
+                permission_mode="bypassPermissions",
+            )
+        )
+        self.assertIn("bypassPermissions", desk_lines)
+        self.assertIn("无「待审核卡片」UI", desk_lines)
+        self.assertIn("Auto", desk_lines)
+
+        desk_auto_lines = "\n".join(
+            _format_inbound_guidance(
+                "parity_check",
+                "未显式配置",
+                entrypoint="claude-desktop",
+                permission_mode="auto",
+            )
+        )
+        self.assertIn("目标会话当前探测模式为 `auto`", desk_auto_lines)
+        self.assertNotIn("请将目标会话左下角权限模式从 `bypassPermissions` 切为", desk_auto_lines)
+
+        held_cfg_lines = "\n".join(
+            _format_receipt_event(
+                {"status": "held"},
+                "req_hold123",
+                "claude-desktop",
+                "UI重构",
+                "sid-1",
+                policy="hold",
+                policy_src="用户全局配置: ~/.claude/settings.json",
+                permission_mode="auto",
+            )
+        )
+        self.assertIn("切换权限模式无法放行", held_cfg_lines)
+        self.assertNotIn("从 bypassPermissions 切为", held_cfg_lines)
+
+        cli_lines = "\n".join(
+            _format_inbound_guidance(
+                "parity_check",
+                "未显式配置",
+                entrypoint="cli",
+                permission_mode="bypassPermissions",
+            )
+        )
+        self.assertIn("Review it below", cli_lines)
+        self.assertIn("终端底部", cli_lines)
+        self.assertNotIn("无「待审核卡片」UI", cli_lines)
+
+    def test_peer_receipt_listener_rejects_unsafe_dir(self):
+        import socket
+        from agent_pair_ipc.claude import PeerReceiptListener
+
+        with tempfile.TemporaryDirectory(dir="/tmp") as td:
+            unsafe_dir = Path(td) / "world_writable"
+            unsafe_dir.mkdir(mode=0o777)
+            os.chmod(unsafe_dir, 0o777)
+            listener = PeerReceiptListener(str(unsafe_dir / "4646.sock"))
+            try:
+                self.assertIsNone(listener.start())
+            finally:
+                listener.close()
+
+            real_dir = Path(td) / "real"
+            real_dir.mkdir(mode=0o700)
+            link_dir = Path(td) / "sym"
+            os.symlink(real_dir, link_dir)
+            listener_sym = PeerReceiptListener(str(link_dir / "4646.sock"))
+            try:
+                self.assertIsNone(listener_sym.start())
+            finally:
+                listener_sym.close()
+
+            # Over-long AF_UNIX path (>103 bytes) returns None without failing
+            long_dir = real_dir / ("a" * 90)
+            long_dir.mkdir(mode=0o700)
+            listener_long = PeerReceiptListener(str(long_dir / "4646.sock"))
+            try:
+                self.assertIsNone(listener_long.start())
+            finally:
+                listener_long.close()
+
+            # EADDRINUSE on bind must NOT unlink an existing socket file
+            existing_sock = real_dir / "ap-existing.sock"
+            srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            srv.bind(str(existing_sock))
+            listener_eaddr = PeerReceiptListener(str(real_dir / "4646.sock"))
+            try:
+                with patch("agent_pair_ipc.claude.os.path.join", return_value=str(existing_sock)):
+                    self.assertIsNone(listener_eaddr.start())
+                self.assertTrue(existing_sock.exists())
+            finally:
+                listener_eaddr.close()
+                srv.close()
+
+    def test_peer_receipt_listener_held_then_delivered_e2e(self):
+        import io
+        import socket
+        import threading
+        import time
+        from contextlib import redirect_stderr
+        from agent_pair_ipc.claude import send_and_wait
+        from agent_pair_ipc.common import extract_nonce
+
+        with tempfile.TemporaryDirectory(dir="/tmp") as td:
+            sock_path = os.path.join(td, "4646.sock")
+            tr_path = os.path.join(td, "sess.jsonl")
+            Path(tr_path).touch()
+
+            srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            srv.bind(sock_path)
+            srv.listen(4)
+            observed: dict = {}
+            stop_event = threading.Event()
+
+            def server_worker():
+                conn, _ = srv.accept()
+                data = b""
+                while True:
+                    chunk = conn.recv(65536)
+                    if not chunk:
+                        break
+                    data += chunk
+                conn.close()
+                lines = [json.loads(line) for line in data.decode("utf-8").splitlines() if line.strip()]
+                observed["auth"] = lines[0]
+                user_frame = lines[1]
+                observed["user"] = user_frame
+
+                from_addr = user_frame.get("from", "")
+                msg_id = user_frame.get("msg_id", "")
+                nonce = extract_nonce(user_frame["message"]["content"])
+                receipt_sock = from_addr[4:]
+
+                # 1. Send HELD receipt (and keep connection briefly open like macOS Claude 150ms delay)
+                c1 = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                c1.connect(receipt_sock)
+                c1.sendall((json.dumps({
+                    "type": "control",
+                    "action": "peer_message_status",
+                    "status": "held",
+                    "reason": "held for mode parity",
+                    "orig_msg_id": msg_id,
+                }) + "\n").encode("utf-8"))
+                time.sleep(0.18)
+                c1.close()
+
+                # 2. Simulate user switching Desktop mode -> DELIVERED receipt + transcript completion
+                time.sleep(0.1)
+                c2 = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                c2.connect(receipt_sock)
+                c2.sendall((json.dumps({
+                    "type": "control",
+                    "action": "peer_message_status",
+                    "status": "delivered",
+                    "orig_msg_id": msg_id,
+                }) + "\n").encode("utf-8"))
+                c2.close()
+
+                with open(tr_path, "a", encoding="utf-8") as f:
+                    f.write(json.dumps({"type": "user", "message": {"role": "user", "content": f"[{nonce}]"}}) + "\n")
+                    f.write(json.dumps({
+                        "type": "assistant",
+                        "message": {"id": "m_rel", "role": "assistant", "stop_reason": "end_turn", "content": [{"type": "text", "text": "Released!\n\nVERDICT: SIGN_OFF"}]},
+                    }) + "\n")
+                stop_event.set()
+
+            t = threading.Thread(target=server_worker, daemon=True)
+            t.start()
+
+            fake_session = {
+                "pid": os.getpid(),
+                "session_id": "2b214ae2-acba-4fda-88c1-5674e6d82559",
+                "host_session_id": "local_1214bb42",
+                "name": "UI重构",
+                "entrypoint": "claude-desktop",
+                "cwd": os.getcwd(),
+                "socket_path": sock_path,
+                "token": "tok_e2e",
+                "transcript_path": tr_path,
+                "permission_mode": "bypassPermissions",
+                "mtime": 100.0,
+            }
+            err = io.StringIO()
+            try:
+                with patch("agent_pair_ipc.claude.get_active_sessions", return_value=[fake_session]), \
+                     patch("agent_pair_ipc.claude.match_session", return_value=(fake_session, "matched")), \
+                     patch("agent_pair_ipc.claude.is_pid_alive", return_value=True), \
+                     patch("agent_pair_ipc.claude.resolve_cross_session_inbound_policy", return_value=("parity_check", "默认")), \
+                     redirect_stderr(err):
+                    resp, verdict = send_and_wait("Check", target="2b214ae2-acba-4fda-88c1-5674e6d82559", timeout=5.0, fast_fail_timeout=2.0)
+                stop_event.wait(timeout=2.0)
+                self.assertEqual(verdict, "SIGN_OFF")
+                self.assertEqual(resp, "Released!\n\nVERDICT: SIGN_OFF")
+                self.assertEqual(observed["auth"], {"type": "auth", "token": "tok_e2e"})
+                self.assertTrue(observed["user"]["from"].startswith(f"uds:{td}/ap-"))
+                self.assertRegex(
+                    observed["user"]["msg_id"],
+                    r"^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+                )
+                self.assertIn('from-mode="prompting"', observed["user"]["message"]["content"])
+                self.assertIn("Delivery status: HELD", err.getvalue())
+                self.assertIn("Delivery status: DELIVERED", err.getvalue())
+                self.assertNotIn("目标 Claude Desktop 会话当前为 bypassPermissions", err.getvalue())
+                self.assertEqual(list(Path(td).glob("ap-*.sock")), [])
+            finally:
+                srv.close()
+
+    def test_peer_receipt_listener_refused_and_dropped_fail_fast_immediately(self):
+        import io
+        import socket
+        import threading
+        import time
+        from contextlib import redirect_stderr
+        from agent_pair_ipc.claude import send_and_wait
+
+        for case in ("refused_via_expired", "dropped"):
+            with tempfile.TemporaryDirectory(dir="/tmp") as td:
+                sock_path = os.path.join(td, "4646.sock")
+                tr_path = os.path.join(td, "sess.jsonl")
+                Path(tr_path).touch()
+
+                srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                srv.bind(sock_path)
+                srv.listen(4)
+
+                def server_worker(case_name=case):
+                    conn, _ = srv.accept()
+                    data = b""
+                    while True:
+                        chunk = conn.recv(65536)
+                        if not chunk:
+                            break
+                        data += chunk
+                    conn.close()
+                    lines = [json.loads(line) for line in data.decode("utf-8").splitlines() if line.strip()]
+                    user_frame = lines[1]
+                    receipt_sock = user_frame["from"][4:]
+                    msg_id = user_frame["msg_id"]
+
+                    c = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                    c.connect(receipt_sock)
+                    # Uncorrelated frames (missing orig_msg_id, empty dropped_msg_ids, or wrong orig_msg_id) must ALL be ignored
+                    c.sendall((json.dumps({
+                        "type": "control",
+                        "action": "peer_message_status",
+                        "status": "held",
+                    }) + "\n").encode("utf-8"))
+                    c.sendall((json.dumps({
+                        "type": "control",
+                        "action": "peer_message_status",
+                        "status": "dropped",
+                        "dropped_msg_ids": [],
+                    }) + "\n").encode("utf-8"))
+                    c.sendall((json.dumps({
+                        "type": "control",
+                        "action": "peer_message_status",
+                        "status": "held",
+                        "orig_msg_id": "00000000-0000-4000-8000-000000000000",
+                    }) + "\n").encode("utf-8"))
+                    if case_name == "refused_via_expired":
+                        c.sendall((json.dumps({
+                            "type": "control",
+                            "action": "peer_message_status",
+                            "status": "expired",
+                            "status_detail": "refused",
+                            "orig_msg_id": msg_id,
+                        }) + "\n").encode("utf-8"))
+                    else:
+                        c.sendall((json.dumps({
+                            "type": "control",
+                            "action": "peer_message_status",
+                            "status": "dropped",
+                            "drop_reason": "rate-limited",
+                            "dropped_msg_ids": [msg_id],
+                        }) + "\n").encode("utf-8"))
+                    c.close()
+
+                t = threading.Thread(target=server_worker, daemon=True)
+                t.start()
+
+                fake_session = {
+                    "pid": os.getpid(),
+                    "session_id": f"sess-{case}",
+                    "host_session_id": f"host-{case}",
+                    "name": "FailFast Target",
+                    "entrypoint": "claude-desktop",
+                    "cwd": os.getcwd(),
+                    "socket_path": sock_path,
+                    "token": "tok_ff",
+                    "transcript_path": tr_path,
+                    "mtime": 100.0,
+                }
+                err = io.StringIO()
+                try:
+                    t0 = time.monotonic()
+                    with patch("agent_pair_ipc.claude.get_active_sessions", return_value=[fake_session]), \
+                         patch("agent_pair_ipc.claude.match_session", return_value=(fake_session, "matched")), \
+                         patch("agent_pair_ipc.claude.is_pid_alive", return_value=True), \
+                         patch("agent_pair_ipc.claude.resolve_cross_session_inbound_policy", return_value=("refuse", "测试配置")), \
+                         redirect_stderr(err):
+                        resp, verdict = send_and_wait("Hi", target=fake_session["session_id"], timeout=30.0, fast_fail_timeout=30.0)
+                    elapsed = time.monotonic() - t0
+                    self.assertIsNone(resp)
+                    self.assertEqual(verdict, "QUEUED_UNCONSUMED")
+                    self.assertLess(elapsed, 2.0)
+                    if case == "refused_via_expired":
+                        self.assertIn("Delivery status: REFUSED", err.getvalue())
+                    else:
+                        self.assertIn("Delivery status: DROPPED", err.getvalue())
+                        self.assertIn("rate-limited", err.getvalue())
+                    self.assertIn("可安全重发", err.getvalue())
+                    self.assertNotIn("Delivery status: HELD", err.getvalue())
+                    self.assertEqual(list(Path(td).glob("ap-*.sock")), [])
+                finally:
+                    srv.close()
+
+    def test_send_message_to_claude_non_wait_captures_immediate_held_receipt_and_cleans_up(self):
+        import io
+        import socket
+        import threading
+        from contextlib import redirect_stderr
+        from agent_pair_ipc.claude import send_message_to_claude
+
+        with tempfile.TemporaryDirectory(dir="/tmp") as td:
+            sock_path = os.path.join(td, "4646.sock")
+            srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            srv.bind(sock_path)
+            srv.listen(2)
+
+            def server_worker():
+                conn, _ = srv.accept()
+                data = b""
+                while True:
+                    chunk = conn.recv(65536)
+                    if not chunk:
+                        break
+                    data += chunk
+                conn.close()
+                lines = [json.loads(line) for line in data.decode("utf-8").splitlines() if line.strip()]
+                user_frame = lines[1]
+                receipt_sock = user_frame["from"][4:]
+                msg_id = user_frame["msg_id"]
+                c = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                c.connect(receipt_sock)
+                c.sendall((json.dumps({
+                    "type": "control",
+                    "action": "peer_message_status",
+                    "status": "held",
+                    "orig_msg_id": msg_id,
+                }) + "\n").encode("utf-8"))
+                c.close()
+
+            t = threading.Thread(target=server_worker, daemon=True)
+            t.start()
+
+            fake_session = {
+                "pid": os.getpid(),
+                "session_id": "sess-nonwait",
+                "host_session_id": "host-nonwait",
+                "name": "UI重构",
+                "entrypoint": "claude-desktop",
+                "cwd": os.getcwd(),
+                "socket_path": sock_path,
+                "token": "tok_nw",
+                "permission_mode": "bypassPermissions",
+            }
+            err = io.StringIO()
+            try:
+                with patch("agent_pair_ipc.claude._resolve_or_await_session", return_value=(fake_session, "matched")), \
+                     patch("agent_pair_ipc.claude.resolve_cross_session_inbound_policy", return_value=("parity_check", "默认")), \
+                     redirect_stderr(err):
+                    ok = send_message_to_claude("Check UI", target="sess-nonwait", auto_await_new=False)
+                self.assertTrue(ok)
+                self.assertIn("Delivery status: HELD", err.getvalue())
+                self.assertIn("Claude Desktop 无「待审核卡片」UI", err.getvalue())
+                self.assertEqual(list(Path(td).glob("ap-*.sock")), [])
+            finally:
+                srv.close()
+
+    def test_send_message_to_claude_non_wait_returns_false_on_refused_and_list_sessions_shows_mode(self):
+        import io
+        import socket
+        import threading
+        from contextlib import redirect_stderr, redirect_stdout
+        from agent_pair_ipc.claude import list_sessions, main
+        from agent_pair_ipc.common import EXIT_ERROR
+
+        with tempfile.TemporaryDirectory(dir="/tmp") as td:
+            sock_path = os.path.join(td, "4646.sock")
+            srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            srv.bind(sock_path)
+            srv.listen(2)
+
+            def server_worker():
+                conn, _ = srv.accept()
+                data = b""
+                while True:
+                    chunk = conn.recv(65536)
+                    if not chunk:
+                        break
+                    data += chunk
+                conn.close()
+                lines = [json.loads(line) for line in data.decode("utf-8").splitlines() if line.strip()]
+                user_frame = lines[1]
+                receipt_sock = user_frame["from"][4:]
+                msg_id = user_frame["msg_id"]
+                c = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                c.connect(receipt_sock)
+                c.sendall((json.dumps({
+                    "type": "control",
+                    "action": "peer_message_status",
+                    "status": "expired",
+                    "status_detail": "refused",
+                    "orig_msg_id": msg_id,
+                }) + "\n").encode("utf-8"))
+                c.close()
+
+            t = threading.Thread(target=server_worker, daemon=True)
+            t.start()
+
+            fake_session = {
+                "pid": os.getpid(),
+                "session_id": "sess-nonwait-refuse",
+                "host_session_id": "host-nonwait-refuse",
+                "name": "Refusing Target",
+                "entrypoint": "claude-desktop",
+                "cwd": os.getcwd(),
+                "socket_path": sock_path,
+                "token": "tok_nwr",
+                "permission_mode": "bypassPermissions",
+                "kind": "interactive",
+                "status": "idle",
+                "transcript_path": "",
+            }
+            out = io.StringIO()
+            err = io.StringIO()
+            try:
+                with patch("agent_pair_ipc.claude._resolve_or_await_session", return_value=(fake_session, "matched")), \
+                     patch("agent_pair_ipc.claude.resolve_cross_session_inbound_policy", return_value=("refuse", "用户全局配置")), \
+                     redirect_stdout(out), redirect_stderr(err):
+                    rc = main(["-m", "Check UI", "-s", "sess-nonwait-refuse"])
+                self.assertEqual(rc, EXIT_ERROR)
+                self.assertNotIn("Message successfully delivered", out.getvalue())
+                self.assertIn("Delivery status: REFUSED", err.getvalue())
+                self.assertEqual(list(Path(td).glob("ap-*.sock")), [])
+            finally:
+                srv.close()
+
+            # Verify list_sessions renders Mode line and Desktop bypassPermissions warning
+            list_out = io.StringIO()
+            sess_auto = {**fake_session, "pid": os.getpid() + 1, "session_id": "sess-auto", "host_session_id": "host-auto", "permission_mode": "auto"}
+            with patch("agent_pair_ipc.claude.get_active_sessions", return_value=[fake_session, sess_auto]), \
+                 patch("agent_pair_ipc.claude.get_offline_sessions", return_value=[]), \
+                 redirect_stdout(list_out):
+                list_sessions()
+            list_text = list_out.getvalue()
+            self.assertIn("└─ Mode:       bypassPermissions (⚠️ Desktop bypassPermissions holds external messages under default parity_check)", list_text)
+            self.assertIn("└─ Mode:       auto", list_text)
 
 
 if __name__ == "__main__":

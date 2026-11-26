@@ -392,13 +392,13 @@ class TestCodex(unittest.TestCase):
         fake_session = {
             "id": "thread-path-guard",
             "name": "Path Guard Thread",
-            "cwd": "/Users/liuvictory/projects/AI_PM",
+            "cwd": "/Users/alice/projects/AI_PM",
             "jsonl_path": "/fake/tr.jsonl",
             "mtime": 100.0,
         }
 
         # Case 1: Target starts with /
-        sess, status = match_session(target="/Users/liuvictory/projects/AI_PM", candidates=[fake_session])
+        sess, status = match_session(target="/Users/alice/projects/AI_PM", candidates=[fake_session])
         self.assertIsNone(sess)
         self.assertEqual(status, "invalid_target")
 
